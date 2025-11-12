@@ -110,9 +110,9 @@ static void mainloop(void) {
       case SDL_SCANCODE_T: p->board_test = 1; break; // board test
 
       case SDL_SCANCODE_M: p->mute_audio = !p->mute_audio; break;
-      case SDL_SCANCODE_P: is_paused = !is_paused; break;
+      case SDL_SCANCODE_P: is_paused = !is_paused; break;*/
       case SDL_SCANCODE_S: screenshot(p); break;
-      case SDL_SCANCODE_I: pac_cheat_invincibility(p); break;
+      /*case SDL_SCANCODE_I: pac_cheat_invincibility(p); break;
       case SDL_SCANCODE_TAB: speed = 5; break;*/
       default: break;
       }
@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  // pac init
+  // spectrum init
   char* base_path = SDL_GetBasePath();
   // ignoring "-psn" argument from macOS Finder
   // https://hg.libsdl.org/SDL/file/c005c49beaa9/test/testdropfile.c#l47
@@ -243,14 +243,14 @@ int main(int argc, char** argv) {
   }
   char* rom_dir = argc > 1 ? argv[1] : base_path;
 
-  p = SDL_calloc(1, sizeof(pac));
+  p = SDL_calloc(1, sizeof(spectrum));
   if (spectrum_init(p, rom_dir) != 0) {
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Missing rom files",
-        "Please copy rom files next to pac executable.", window);
+        "Please copy rom files next to spectrum executable.", window);
     return 1;
   }
   p->sample_rate = audio_spec.freq;
-  p->push_sample = push_sample;
+  //p->push_sample = push_sample;
   p->update_screen = update_screen;
   update_screen(p);
 
