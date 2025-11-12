@@ -12,8 +12,8 @@
 #define SPECTRUM_CLOCK_SPEED 3072000 // 3.072 MHz (= number of cycles per second)
 #define SPECTRUM_FPS 60
 #define SPECTRUM_CYCLES_PER_FRAME (SPECTRUM_CLOCK_SPEED / SPECTRUM_FPS)
-#define SPECTRUM_SCREEN_WIDTH	224
-#define SPECTRUM_SCREEN_HEIGHT	288
+#define SPECTRUM_SCREEN_WIDTH	256
+#define SPECTRUM_SCREEN_HEIGHT	192
 
 typedef struct spectrum spectrum;
 struct spectrum {
