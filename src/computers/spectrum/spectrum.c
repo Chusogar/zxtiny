@@ -401,7 +401,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   p->audio_buffer = calloc(p->audio_buffer_len, sizeof(int16_t));
   p->sample_rate = 44100;
   p->mute_audio = false;
-  p->push_sample = NULL;
+  //p->push_sample = NULL;
 
   return r != 0;
 }

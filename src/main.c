@@ -35,7 +35,7 @@ static void update_screen(spectrum* const p) {
   if (SDL_LockTexture(texture, NULL, &pixels, &pitch) != 0) {
     SDL_Log("Unable to lock texture: %s", SDL_GetError());
   } else {
-    SDL_memcpy(pixels, p->screen_buffer, pitch * PAC_SCREEN_HEIGHT);
+    SDL_memcpy(pixels, p->screen_buffer, pitch * SPECTRUM_SCREEN_HEIGHT);
   }
   SDL_UnlockTexture(texture);
 }
@@ -140,7 +140,7 @@ static void mainloop(void) {
   }
 
   if (!is_paused && has_focus) {
-    pac_update(p, dt * speed);
+    spectrum_update(p, dt * speed);
   }
 
   SDL_RenderClear(renderer);
