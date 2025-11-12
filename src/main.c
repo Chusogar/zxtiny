@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
 
   // create SDL window
   SDL_Window* window = SDL_CreateWindow("ZXtiny", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, PAC_SCREEN_WIDTH * 2, PAC_SCREEN_HEIGHT * 2,
+      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH * 2, SPECTRUM_SCREEN_HEIGHT * 2,
       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 
   if (window == NULL) {
