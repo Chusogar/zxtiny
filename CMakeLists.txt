@@ -6,7 +6,7 @@ project(zxtiny
   HOMEPAGE_URL "https://github.com/chusogar/zxtiny"
 )
 
-set(SOURCES src/main.c src/computers/spectrum.c src/cpu/z80/z80.c)
+set(SOURCES src/main.c src/computers/spectrum/spectrum.c src/cpu/z80/z80.c)
 set(ROMS_DIR "./roms/" CACHE STRING "Path to directory containing rom files")
 
 add_executable(zxtiny ${SOURCES})
