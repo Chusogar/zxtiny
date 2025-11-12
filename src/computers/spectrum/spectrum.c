@@ -131,7 +131,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
 
   memset(p->rom, 0, sizeof(p->rom));
   memset(p->ram, 0, sizeof(p->ram));
-  memset(p->sprite_pos, 0, sizeof(p->sprite_pos));
+  //memset(p->sprite_pos, 0, sizeof(p->sprite_pos));
   memset(p->screen_buffer, 0, sizeof(p->screen_buffer));
 
   p->int_vector = 0;
@@ -193,12 +193,13 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   //free(file8);
   // free(file9);
 
-  preload_images(p);
+  //preload_images(p);
   p->update_screen = NULL;
 
   // audio
   //wsg_init(&p->sound_chip, p->sound_rom1);
-  p->audio_buffer_len = WSG_SAMPLE_RATE / PAC_FPS;
+  //p->audio_buffer_len = WSG_SAMPLE_RATE / PAC_FPS;
+  p->audio_buffer_len = 0xffff;
   p->audio_buffer = calloc(p->audio_buffer_len, sizeof(int16_t));
   p->sample_rate = 44100;
   p->mute_audio = false;
