@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
 
   // create SDL window
   SDL_Window* window = SDL_CreateWindow("ZXtiny", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH * 2, SPECTRUM_SCREEN_HEIGHT * 2,
+      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT,
       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 
   if (window == NULL) {
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
   SDL_GetRendererInfo(renderer, &renderer_info);
   SDL_Log("Using renderer %s", renderer_info.name);
 
-  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24,
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
       SDL_TEXTUREACCESS_STREAMING, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT);
   if (texture == NULL) {
     SDL_Log("Unable to create texture: %s", SDL_GetError());

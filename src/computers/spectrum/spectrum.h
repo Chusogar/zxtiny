@@ -24,7 +24,10 @@ struct spectrum {
 
   //uint8_t color_rom[32];
   //uint8_t palette_rom[0x100];
-  uint8_t palette[0xf];
+  uint32_t palette[0xf];
+  //uint8_t border;
+  //uint32_t border_screen[320][200] = {0};
+  //long _scanline=0;
   //uint8_t tile_rom[0x1000];
   //uint8_t sprite_rom[0x1000];
   //uint8_t sound_rom1[0x100];
@@ -46,9 +49,9 @@ struct spectrum {
   //bool board_test, p1_start, p2_start;
 
   // ppu
-  uint8_t screen_buffer[SPECTRUM_SCREEN_HEIGHT * SPECTRUM_SCREEN_WIDTH];
+  uint32_t screen_buffer[SPECTRUM_SCREEN_HEIGHT * SPECTRUM_SCREEN_WIDTH];
   void (*update_screen)(spectrum* const n);
-
+  
   // audio
   //wsg sound_chip;
   int audio_buffer_len;
@@ -61,6 +64,7 @@ struct spectrum {
 int spectrum_init(spectrum* const p, const char* rom_dir);
 void spectrum_quit(spectrum* const p);
 void spectrum_update(spectrum* const p, unsigned int ms);
+void init_palette(spectrum* const p);
 
 //void pac_cheat_invincibility(pac* const p);
 
