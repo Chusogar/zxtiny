@@ -288,6 +288,10 @@ unsigned char  get_attribute(unsigned char* scr, int x, int y) {
 	return scr[ get_attribute_address(x,y) + 6144 ];
 }*/
 
+uint32_t getPaletteColor(int color_index) {
+	return spectrum_palette[color_index];
+}
+
 static inline void spectrum_draw(spectrum* const p) {
 	int x, y;
 	int _posi = 0;
@@ -313,7 +317,7 @@ static inline void spectrum_draw(spectrum* const p) {
 
             // Seleccionamos el color de la paleta
 			//uint32_t color = p->spectrum_palette[color_index];
-			uint32_t color = spectrum_palette[color_index];
+			uint32_t color = getPaletteColor(color_index);
 			/*if (color_index != 0)
 			{
 				printf("COLOR: %d\n", color_index);

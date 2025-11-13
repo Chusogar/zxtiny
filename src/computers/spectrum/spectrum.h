@@ -62,6 +62,7 @@ struct spectrum {
 };
 
 int spectrum_init(spectrum* const p, const char* rom_dir);
+uint32_t getPaletteColor(int color);
 void spectrum_quit(spectrum* const p);
 void spectrum_update(spectrum* const p, unsigned int ms);
 void init_palette(spectrum* const p);
