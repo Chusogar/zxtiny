@@ -1,5 +1,7 @@
 #include "spectrum.h"
 
+bool _keyboard_state[1024] = {false};
+
 uint32_t spectrum_palette[16] = {
     0xff000000, /* negro */
 	0xff0000bf, /* azul */

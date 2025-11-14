@@ -49,6 +49,7 @@ static void send_quit_event() {
 }
 
 static void screenshot(spectrum* const p) {
+	printf("Saving...");
   // generate filename
   time_t t = time(NULL);
   struct tm tm = *localtime(&t);
