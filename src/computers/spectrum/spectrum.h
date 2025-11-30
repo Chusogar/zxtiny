@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
-#include "../../cpu/z80/z80.h"
+#include "../../cpu/jgz80/z80.h"
 //#include "wsg.h"
 
 #define SPECTRUM_CLOCK_SPEED 3072000 // 3.072 MHz (= number of cycles per second)
