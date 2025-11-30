@@ -1,3 +1,6 @@
 [submodule "src/cpu/z80"]
 	path = src/cpu/z80
 	url = https://github.com/carmiker/jgz80.git
+[submodule "src/cpu/jgz80"]
+	path = src/cpu/jgz80
+	url = https://github.com/carmiker/jgz80.git
