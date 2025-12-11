@@ -904,7 +904,7 @@ void init_memory()
     // Clear memory
     memset((void *)MEMORY, 0, sizeof(MEMORY));
 
-    if (!(fp = fopen("spectrum.rom", "r")))
+    if (!(fp = fopen("../roms/spectrum/spectrum.rom", "r")))
     {
         fprintf(stderr, "Can't open spectrum.rom\n");
         exit(-1);
