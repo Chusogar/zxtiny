@@ -12,8 +12,8 @@ ZXSpectrum.o : ZXSpectrum.c
 Z80.o : cpu/Z80/Z80.c cpu/Z80/Z80.h
 	$(CC) -c Z80.c -o Z80.o $(CFLAGS)
 	
-ZXSpectrum: ZXSpectrum.o Z80/Z80.o
-	$(CC) ZXSpectrum.o Z80/Z80.o -o ZXSpectrum $(LDFLAGS)
+ZXSpectrum: ZXSpectrum.o cpu/Z80/Z80.o
+	$(CC) ZXSpectrum.o cpu/Z80/Z80.o -o ZXSpectrum $(LDFLAGS)
 
 clean:
 	rm -f ZXSpectrum *.o cpu/Z80/*.o cpu/Z80/dasm
