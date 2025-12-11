@@ -23,6 +23,8 @@ SDL_Renderer *renderer;
 SDL_Window *window;
 SDL_Surface *screen;
 
+float _SCALE = 1;
+
 char *_snapshot;
 
 //static SDL_Renderer* renderer = NULL;
@@ -779,6 +781,19 @@ word LoopZ80(Z80 *R)
             //u32 shift = event.key.keysym.mod & KMOD_SHIFT;
             switch (event.key.keysym.sym)
             {
+			case SDLK_UP:
+                // Handle up key
+				_SCALE+=0.5;
+				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
+				SDL_SetWindowSize(window, SPECTRUM_SCREEN_WIDTH*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+                break;
+            case SDLK_DOWN:
+                // Handle down key
+				_SCALE-=0.5;
+				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
+				SDL_SetWindowSize(window, SPECTRUM_SCREEN_WIDTH*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+                break;
+
             case SDLK_ESCAPE:
                 ExitLoop = 1;
                 break;
@@ -928,6 +943,7 @@ void usage(char *arg0)
     fprintf(stderr, "\nUsage: %s [<GTP file to load> [-j<address>]] [-c<font color>] [-w<work dir>]\n\n", arg0);
 }
 
+
 int main(int argc, char **argv)
 {
     int sizeX = WINDOW_W;
@@ -937,6 +953,13 @@ int main(int argc, char **argv)
     //int font_color = 0;
 
 	_snapshot = argv[1];
+#if 0
+	for (i = 1; i < argc; i++)
+	{
+		if (!strcmp(argv[i], "--scaleX2"))
+			_scale=2;
+	}
+#endif
 
     if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_AUDIO | SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS) == -1)
     {
