@@ -1,9 +1,7 @@
 //================================================================
 //                                                              //
-// GALAKSIJA emulator                                           //
-// DOS Verzija: Copyright (C) by Miodrag Jevremovic 1997.       //
-// Win32 Verzija: copyright (C) by Tomaž Šolc 2002 (?).         //
-// Linux (SDL2) Verzija: Copyright (C) by Peter Bakota 2017.    //
+// ZXtiny emulator                                              //
+// Copyright (C) by Chuso 2025.                                 //
 //                                                              //
 //================================================================
 
@@ -15,15 +13,22 @@
 
 #include "cpu/Z80/Z80.h"
 
-//#define EXECZ80
-
 typedef uint32_t u32;
 
 SDL_Renderer *renderer;
 SDL_Window *window;
-SDL_Surface *screen;
+//SDL_Surface *screen;
+SDL_Texture* texture = NULL;
+
+#define CYCLES_PER_FRAME 69888 //3500000/50
+
+#define NBLINES (1) //(48+192+56+16) //(32+256+32)
+#define CYCLES_PER_STEP (CYCLES_PER_FRAME/NBLINES)
 
 float _SCALE = 1;
+int v_border=0;
+#define h_border 32
+uint32_t bordercolor=0;
 
 char *_snapshot;
 
@@ -49,6 +54,7 @@ void text_at(const char *str, word x, byte y);
 #define FRAMES_PER_SECOND 50
 
 #define SCREEN_W 256
+#define WIDTH  320
 #define SCREEN_H 192
 #define SPECTRUM_SCREEN_WIDTH	256
 #define SPECTRUM_SCREEN_HEIGHT	192
@@ -59,7 +65,7 @@ void text_at(const char *str, word x, byte y);
 Z80 R;
 byte MEMORY[65536]; // max 64k of MEMORY
 
-uint32_t screen_buffer[SPECTRUM_SCREEN_HEIGHT * SPECTRUM_SCREEN_WIDTH];
+uint32_t screen_buffer[SPECTRUM_SCREEN_HEIGHT * (h_border+SPECTRUM_SCREEN_WIDTH+h_border)];
 
 byte Fassst;
 byte ExitLoop;
@@ -88,6 +94,10 @@ uint32_t spectrum_palette[16] = {
 	0xffffff00, /* amarillo brillante */
 	0xffffffff  /* blanco brillante */
 };
+
+uint32_t getPaletteColor(int color_index) {
+	return spectrum_palette[color_index];
+}
 
 bool load_file_to_buffer(const char* path/*, char* buffer*/) {
 	FILE *fp;
@@ -130,6 +140,58 @@ bool load_file_to_buffer(const char* path, vector<uint8_t> &out) {
 	return rd == out.size();
 }
 */
+void load_image_sna(Z80 regs, const char* snapshot_buffer)
+{
+  // Load Z80 registers from SNA
+  regs.I       = snapshot_buffer[ 0];
+  regs.HL1.B.l = snapshot_buffer[ 1];
+  regs.HL1.B.h = snapshot_buffer[ 2];
+  regs.DE1.B.l = snapshot_buffer[ 3];
+  regs.DE1.B.h = snapshot_buffer[ 4];
+  regs.BC1.B.l = snapshot_buffer[ 5];
+  regs.BC1.B.h = snapshot_buffer[ 6];
+  regs.AF1.B.l = snapshot_buffer[ 7];
+  regs.AF1.B.h = snapshot_buffer[ 8];
+  regs.HL.B.l  = snapshot_buffer[ 9];
+  regs.HL.B.h  = snapshot_buffer[10];
+  regs.DE.B.l  = snapshot_buffer[11];
+  regs.DE.B.h  = snapshot_buffer[12];
+  regs.BC.B.l  = snapshot_buffer[13];
+  regs.BC.B.h  = snapshot_buffer[14];
+  regs.IY.B.l  = snapshot_buffer[15];
+  regs.IY.B.h  = snapshot_buffer[16];
+  regs.IX.B.l  = snapshot_buffer[17];
+  regs.IX.B.h  = snapshot_buffer[18];
+//#define IFF_1       0x01       /* IFF1 flip-flop             */
+//#define IFF_IM1     0x02       /* 1: IM1 mode                */
+//#define IFF_IM2     0x04       /* 1: IM2 mode                */
+//#define IFF_2       0x08       /* IFF2 flip-flop             */
+//#define IFF_EI      0x20       /* 1: EI pending              */
+//#define IFF_HALT    0x80       /* 1: CPU HALTed              */
+  regs.R = snapshot_buffer[20]; //R.W
+  regs.AF.B.l = snapshot_buffer[21];
+  regs.AF.B.h = snapshot_buffer[22];
+  regs.SP.B.l =snapshot_buffer[23];
+  regs.SP.B.h =snapshot_buffer[24];
+  regs.IFF = 0;
+  regs.IFF |= (((snapshot_buffer[19] & 0x04) >> 2) ? IFF_1 : 0); //regs->IFF1 = regs->IFF2 = ...
+  regs.IFF |= (((snapshot_buffer[19] & 0x04) >> 2) ? IFF_2 : 0);
+  regs.IFF |= (snapshot_buffer[25]<< 1); // regs->IM = snapshot_buffer[25];
+  //display::bordercolor = snapshot_buffer[26] & 0x07;
+
+  // load RAM from SNA
+  for (int i = 0; i < 0xc000; ++i)
+  {
+    WrZ80(i + 0x4000, snapshot_buffer[27 + i]);
+  }
+  // SP to PC for SNA run
+  regs.PC.B.l = RdZ80(regs.SP.W);
+  regs.SP.W++;
+  regs.PC.B.h = RdZ80(regs.SP.W);
+  regs.SP.W++;
+
+  //loader::snapshot_type = loader::Snapshot::SNA;
+}
 
 bool loadSNA(const char* filename/*, MinZX* targetEmulator*/)
 {
@@ -140,8 +202,11 @@ bool loadSNA(const char* filename/*, MinZX* targetEmulator*/)
 	}
 
 	//targetEmulator->reset();
-	ResetZ80(&R);
+	ResetZ80(&R, CYCLES_PER_FRAME);
 
+	//load_image_sna(R, _snapshot);
+
+#if 1
 	// Read in the registers
 
 	//z80->setRegI(fgetc(pf));
@@ -200,7 +265,7 @@ bool loadSNA(const char* filename/*, MinZX* targetEmulator*/)
 
 	//uint8_t inter = fgetc(pf);
 	//z80->setIFF2(inter & 0x04 ? 1 : 0);
-	R.IFF = (_snapshot[19] & 0x04 ? 1 : 0) ? (R.IFF |= IFF_2) : (R.IFF &= ~IFF_2);
+	//R.IFF = (_snapshot[19] & 0x04 ? 1 : 0) ? (R.IFF |= IFF_2) : (R.IFF &= ~IFF_2);
 
 	//z80->setRegR(fgetc(pf));
 	R.R = _snapshot[20];
@@ -216,13 +281,17 @@ bool loadSNA(const char* filename/*, MinZX* targetEmulator*/)
 	R.SP.B.h = _snapshot[24];
 
 	//z80->setIM((Z80::IntMode)fgetc(pf));
-	if (_snapshot[25]==2) { R.IFF |= IFF_IM2; }
-	if (_snapshot[25]==1) { R.IFF |= IFF_IM1; }
+	//if (_snapshot[25]==2) { R.IFF |= IFF_IM2; }
+	//if (_snapshot[25]==1) { R.IFF |= IFF_IM1; }
 	
 	//targetEmulator->setBorderColor(fgetc(pf));
 
 	//z80->setIFF1(z80->isIFF2());
-	R.IFF = (_snapshot[19] & 0x04 ? 1 : 0) ? (R.IFF |= IFF_1) : (R.IFF &= ~IFF_1);
+	//R.IFF = (_snapshot[19] & 0x04 ? 1 : 0) ? (R.IFF |= IFF_1) : (R.IFF &= ~IFF_1);
+	R.IFF = 0;
+	R.IFF |= (((_snapshot[19] & 0x04) >> 2) ? IFF_1 : 0); //regs->IFF1 = regs->IFF2 = ...
+	R.IFF |= (((_snapshot[19] & 0x04) >> 2) ? IFF_2 : 0);
+	R.IFF |= (_snapshot[25]<< 1); // regs->IM = _snapshot[25];
 	
 	//byte inter = lhandle.read();
 	//_zxCpu.iff2 = (inter & 0x04) ? 1 : 0;
@@ -289,7 +358,7 @@ bool loadSNA(const char* filename/*, MinZX* targetEmulator*/)
 	//targetEmulator->setINT();
 
 	//z80->setRegPC(0x72);
-
+#endif
 	return 0;
 
 }
@@ -422,6 +491,8 @@ inline void WrZ80(word addr, byte val)
     }
 }
 
+uint8_t _ports[0xffff];
+
 inline byte InZ80(word port)
 {
     uint8_t hiport = port >> 8;
@@ -465,12 +536,20 @@ inline byte InZ80(word port)
 
 		return result;
 	}
+  //return _ports[port];
   return 0xff;
 }
 
 inline void OutZ80(word port, byte val)
 {
     //printf("OUT: %02x at %d\n", val, port);
+	if (!(port & 0x01)) {
+		bordercolor = (val & 0x07);
+		byte mic = (val & 0x08);
+		byte ear = (val & 0x10);
+		//buzz(((ear)?1:0), CYCLES_PER_STEP-myCPU.ICount);
+	  }
+	  _ports[port] = val&0xff;
 #if 0
   spectrum* const p = (spectrum*) z->userdata;
 
@@ -486,25 +565,7 @@ inline void PatchZ80(Z80 *R)
     // UNUSED
 }
 
-#if 0
-void show_help()
-{
-    SDL_FillRect(screen, NULL, crna_color);
-    SDL_LockSurface(screen);
 
-    text_at("ZX Spectrum EMULATOR (C)2025 V0.2 ", 0, 0);
-    text_at("--------------------------------", 0, 1);
-    text_at("F1          - TOGGLE HELP       ", 0, 2);
-    text_at("ESC         - QUIT EMULATOR     ", 0, 3);
-    text_at("F12 + SHIFT - NORMAL RESET      ", 0, 4);
-    text_at("F12         - NMI RESET         ", 0, 5);
-    text_at("F8          - TOGGLE CPU SPEED  ", 0, 6);
-    text_at("F2 + SHIFT  - SAVE MEMORY  (GTP)", 0, 7);
-    text_at("F2          - LOAD MEMORY  (GTP)", 0, 8);
-
-    SDL_UnlockSurface(screen);
-}
-#endif
 
 int get_pixel_address(int x, int y) {
 	int y76 = y & 0b11000000; //# third of screen
@@ -520,31 +581,7 @@ int get_attribute_address(int x, int y) {
 	return address;
 }
 
-uint32_t getPaletteColor(int color_index) {
-	return spectrum_palette[color_index];
-}
 
-#if 0
-void put_pixel32( SDL_Texture *surface, int x, int y, Uint32 pixel )
-{
-    //Convert the pixels to 32 bit
-    Uint32 *pixels = (Uint32 *)surface->pixels;
-    
-    //Set the pixel
-    pixels[ ( y * surface->w ) + x ] = 0xffffffff;
-}
-
-void update_screen() {
-  int pitch = 0;
-  void* pixels = NULL;
-  if (SDL_LockTexture(texture, NULL, &pixels, &pitch) != 0) {
-    SDL_Log("Unable to lock texture: %s", SDL_GetError());
-  } else {
-    SDL_memcpy(pixels, screen_buffer, pitch * SPECTRUM_SCREEN_HEIGHT);
-  }
-  SDL_UnlockTexture(texture);
-}
-#endif
 
 /*
 Source - https://stackoverflow.com/a
@@ -561,30 +598,88 @@ void set_pixel(SDL_Surface *surface, int x, int y, Uint32 pixel)
 }
 
 
-void refresh_screen(void)
+void displayscanline(int y, int f_flash)
 {
-#if 0
-    byte x, y;
-    word adresa;
+  int x, row, col, dir_p, dir_a, pixeles, tinta, papel, atributos;
 
-    // 0x2800 - 0x2a00 (size=512) VIDEO MEMORIJA
-    adresa = 0x2800;
+  row = y + v_border;    // 4 & 32 = graphical screen offset
+  col = (y*(h_border + SPECTRUM_SCREEN_WIDTH + h_border));              // 32+256+32=320  4+192+4=200  (res=320x200)
+	//col = y*320;
 
-    SDL_FillRect(screen, NULL, crna_color);
-    SDL_LockSurface(screen);
+  for (x = 0; x < h_border; x++) {
+    screen_buffer[col++] = getPaletteColor(bordercolor);
+  }
 
-    for (y = 0; y < 16; y++)
+
+  dir_p = ((y & 0xC0) << 5) + ((y & 0x07) << 8) + ((y & 0x38) << 2) +0x4000;
+  dir_a = 0x1800 + (32 * (y >> 3)) +0x4000;
+  //printf("Pixel: %d\n",dir_p);
+
+  //dir_p = get_pixel_address(0, y)+0x4000;
+  //dir_a = get_attribute_address(x, y) + 0x4000 + 6144;
+  
+  for (x = 0; x < 32; x++)
+  {
+    pixeles=  MEMORY[dir_p++]; //+0x4000
+    atributos=MEMORY[dir_a++];
+    
+    if (((atributos & 0x80) == 0) || (f_flash == 0))
     {
-        for (x = 0; x < 32; x++)
-        {
-            draw_char(MEMORY[adresa++], x * SIRINA, y * VISINA);
-        }
+      tinta = (atributos & 0x07) + ((atributos & 0x40) >> 3);
+      papel = (atributos & 0x78) >> 3;
+    }
+    else
+    {
+      papel = (atributos & 0x07) + ((atributos & 0x40) >> 3);
+      tinta = (atributos & 0x78) >> 3;
     }
 
-    SDL_UnlockSurface(screen);
-#endif
+	//int tinta = (int) (_attr & 0b0111);
+	//int papel = ((_attr & 0x38) /8);//(int)((_attr >> 3) & 0b0111);
 
-	SDL_LockSurface(screen);
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x80) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x40) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x20) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x10) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x08) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x04) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x02) ? tinta : papel) );
+    screen_buffer[col++] = getPaletteColor( ((pixeles & 0x01) ? tinta : papel) );
+  }
+
+
+  for (x = 0; x < h_border; x++) {
+    screen_buffer[col++] = getPaletteColor( bordercolor );
+  }
+
+  
+  //emu_DrawLinePal16(XBuf, WIDTH, HEIGHT, y);
+}
+static int f_flash = 1, f_flash2 = 0;
+void displayScreen(void) {
+  int y;
+  
+  f_flash2 = (f_flash2++) % 32;
+  if (f_flash2 < 16)
+    f_flash = 1;
+  else
+    f_flash = 0;
+  
+  for (y = 0; y < SPECTRUM_SCREEN_HEIGHT; y++){
+    ExecZ80(&R,224);
+	displayscanline (y, f_flash);
+  }
+ 
+  //emu_DrawVsync();   
+}
+
+
+void refresh_screen(void)
+{
+
+	//SDL_LockSurface(screen);
+
+	//screen->pitch = 0;
 
 	//byte *ptr = screen->pixels;
 
@@ -633,19 +728,24 @@ void refresh_screen(void)
 			//*(u32 *)ptr = color;
             //ptr += screen->format->BytesPerPixel;
 			//ptr ++;
-			set_pixel(screen, x, y, color);
+			//set_pixel(screen, x, y, color);
+			screen_buffer[(y*SPECTRUM_SCREEN_WIDTH) + x] = color;
 			//_posi++;
         }
     }
 
-	SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, screen);
+	/*SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, screen);
 
 	SDL_Rect src = {0, 0, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT},
              dst = {0, 0, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT};
 
         SDL_RenderCopy(renderer, tex, &src, &dst);
 
+		SDL_RenderPresent( renderer );
+        SDL_DestroyTexture( tex );
+
 	SDL_UnlockSurface(screen);
+	*/
 #if 0
 	for (int _i=0 ; _i<100 ; _i++ )
 	{
@@ -695,7 +795,20 @@ void read_keyboard(void)
 */
 }
 
-word LoopZ80(Z80 *R)
+void update_screen(void) {
+  int pitch = 0;
+  void* pixels = NULL;
+  if (SDL_LockTexture(texture, NULL, &pixels, &pitch) != 0) {
+    SDL_Log("Unable to lock texture: %s", SDL_GetError());
+  } else {
+    SDL_memcpy(pixels, screen_buffer, pitch * SPECTRUM_SCREEN_HEIGHT);
+  }
+  SDL_UnlockTexture(texture);
+}
+
+//#define EXECZ80
+
+word new_LoopZ80(Z80 *R)
 {
     u32 current_time = SDL_GetTicks();
     float dt = (float)(current_time - last_time) / 1000.0f;
@@ -714,53 +827,11 @@ word LoopZ80(Z80 *R)
         //frame_ready = 1;
     }
 
-    SDL_Delay((int)(1000/50));
+    //SDL_Delay((int)(1000/50));
 
-#if 0
-
-    if (active_help)
-    {
-        //show_help();
-		printf("HELP!\n");
-    }
-    else //if(frame_ready)
-    {
-        if (!(R->IFF & IFF_2))
-        {
-            Fassst++;
-        }
-        else
-        {
-            Fassst = 0;
-        }
-
-        // Ako je EI osvezavaj i ekran i tastaturu, kao i kod prave masine.
-        if (!Fassst)
-        {
-            read_keyboard();
-            refresh_screen();
-        }
-        else
-        {
-            switch (Fassst)
-            {
-            // Because screen is made under IRQ, there is no more further screen updates.
-            case 1:
-                // Need to clear it ?
-                SDL_FillRect(screen, NULL, crna_color);
-                break;
-
-            // Stay where You are.
-            case 2:
-                Fassst--;
-                break;
-            }
-        }
-    }
-#endif
 
 	read_keyboard();
-	 refresh_screen();
+	
 
     SDL_Event event;
     while (SDL_PollEvent(&event))
@@ -785,13 +856,13 @@ word LoopZ80(Z80 *R)
                 // Handle up key
 				_SCALE+=0.5;
 				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
-				SDL_SetWindowSize(window, SPECTRUM_SCREEN_WIDTH*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
                 break;
             case SDLK_DOWN:
                 // Handle down key
 				_SCALE-=0.5;
 				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
-				SDL_SetWindowSize(window, SPECTRUM_SCREEN_WIDTH*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
                 break;
 
             case SDLK_ESCAPE:
@@ -813,7 +884,7 @@ word LoopZ80(Z80 *R)
             case SDLK_F12: // HARD/NMI RESET
                 //if (shift)
                 {
-                    ResetZ80(R);
+                    ResetZ80(R, CYCLES_PER_FRAME);
                     return INT_NONE;
                 }
                 //else
@@ -824,47 +895,27 @@ word LoopZ80(Z80 *R)
         break;
         }
     }
-#if 1
-    /* Select the color for drawing. It is set to black here. */
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 
-    // Clear the window
-    SDL_RenderClear(renderer);
+	int scanl;
+	  for (scanl = 0; scanl < NBLINES; scanl++) {
+		//lastBuzzCycle=0;
+		//ExecZ80(R,CYCLES_PER_STEP); // 3.5MHz ticks for 6 lines @ 30 kHz = 700 cycles
+	#ifdef HAS_SND
+	#ifdef CUSTOM_SND 
+		//buzz(lastBuzzVal, CYCLES_PER_STEP);
+	#endif
+	#endif    
+		//busy_wait_us(1);
+		//sleep_us(1);
+	  }
 
-    // 0x2bb0 = BROJAC ZA POMERANJE SLIKE
-    //int yOff = (int)MEMORY[0x2BB0] * 3;
+	//refresh_screen();
+	displayScreen();
+	update_screen();
 
-    // 0x2ba8 = HORIZONTALNA POZICIJA TEKSTA
-    //int xOff = (int)MEMORY[0x2BA8] * 8;
-
-    /*if (active_help)
-    {
-        yOff = 0;
-    }*/
-
-    SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, screen);
-
-    //if (yOff)
-    //{
-        // yOff = 9..6..3..0
-        //int o = 9;
-        SDL_Rect src = {0, 0, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT},
-                 dst = {0, 0, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT};
-
-        SDL_RenderCopy(renderer, tex, &src, &dst);
-    /*}
-    else
-    {
-        SDL_Rect src = {0, 0, SCREEN_W, SCREEN_H},
-                 dst = {xOff + (WINDOW_W - SCREEN_W * 2) / 2 - 88, (WINDOW_H - SCREEN_H * 2) / 2, 2 * SCREEN_W, 2 * SCREEN_H};
-
-        SDL_RenderCopy(renderer, tex, &src, &dst);
-    }*/
-
-    // Render the changes above ( which up until now had just happened behind the scenes )
-    SDL_RenderPresent(renderer);
-    SDL_DestroyTexture(tex);
-#endif
+	SDL_RenderClear(renderer);
+	SDL_RenderCopy(renderer, texture, NULL, NULL);
+	SDL_RenderPresent(renderer);
 
     if (ExitLoop)
     {
@@ -897,16 +948,22 @@ word start_machine()
 
     R.IPeriod = cpu_speed / FRAMES_PER_SECOND;
 
-    ResetZ80(&R);
+    ResetZ80(&R, CYCLES_PER_FRAME);
 
 	if (_snapshot != 0)
 	{
 		printf("trying to load %s", _snapshot);
 		loadSNA( _snapshot );
 	}
+
+	while (!ExitLoop)
+	{
+		new_LoopZ80(&R);
+	}
 	
 
-    return RunZ80(&R);
+    //return RunZ80(&R);
+	return R.PC.W;
 }
 
 void init_memory()
@@ -918,6 +975,7 @@ void init_memory()
 
     // Clear memory
     memset((void *)MEMORY, 0, sizeof(MEMORY));
+	memset((void *)_ports, 0xff, sizeof(_ports));
 
     if (!(fp = fopen("../roms/spectrum/spectrum.rom", "r")))
     {
@@ -946,7 +1004,7 @@ void usage(char *arg0)
 
 int main(int argc, char **argv)
 {
-    int sizeX = WINDOW_W;
+    int sizeX = (h_border + SPECTRUM_SCREEN_WIDTH + h_border);
     int sizeY = WINDOW_H;
     //int i;
     //char *ptr;
@@ -975,12 +1033,12 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    screen = SDL_CreateRGBSurface(0, SCREEN_W, SCREEN_H, 32, 0, 0, 0, 0);
+    /*screen = SDL_CreateRGBSurface(0, SCREEN_W, SCREEN_H, 32, 0, 0, 0, 0);
     if (screen == NULL)
     {
         fprintf(stderr, "Failed to create screen : %s\n", SDL_GetError());
         return -1;
-    }
+    }*/
 
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (renderer == NULL)
@@ -989,58 +1047,23 @@ int main(int argc, char **argv)
         return -1;
     }
 
-#if 0
-	// SDL init
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) !=
-      0) {
-    SDL_Log("Unable to initialise SDL: %s", SDL_GetError());
-    return 1;
-  }
+	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, h_border+SPECTRUM_SCREEN_WIDTH+h_border, SPECTRUM_SCREEN_HEIGHT);
+	if (texture == NULL) {
+		SDL_Log("Unable to create texture: %s", SDL_GetError());
+		return 1;
+	}
 
-  SDL_SetHint(SDL_HINT_BMP_SAVE_LEGACY_FORMAT, "1");
-
-  // create SDL window
-  SDL_Window* window = SDL_CreateWindow("ZXtiny", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT,
-      SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-
-  if (window == NULL) {
-    SDL_Log("Unable to create window: %s", SDL_GetError());
-    return 1;
-  }
-
-  SDL_SetWindowMinimumSize(window, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT);
-
-  // create renderer
-  renderer = SDL_CreateRenderer(
-      window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-  if (renderer == NULL) {
-    SDL_Log("Unable to create renderer: %s", SDL_GetError());
-    return 1;
-  }
-
-  SDL_RenderSetLogicalSize(renderer, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT);
-
-  // print info on renderer:
-  SDL_RendererInfo renderer_info;
-  SDL_GetRendererInfo(renderer, &renderer_info);
-  SDL_Log("Using renderer %s", renderer_info.name);
-
-  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-      SDL_TEXTUREACCESS_STREAMING, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT);
-  if (texture == NULL) {
-    SDL_Log("Unable to create texture: %s", SDL_GetError());
-    return 1;
-  }
-  #endif
     init_memory();
 
     word pc = start_machine();
     fprintf(stderr, "Leaving emulator PC=$%04x\n", pc);
 
     //SDL_FreeSurface(screen);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    SDL_DestroyTexture(texture);
+	SDL_DestroyRenderer(renderer);
+	SDL_DestroyWindow(window);
+	//SDL_CloseAudioDevice(audio_device);
+	SDL_Quit();
 
     return 0;
 }

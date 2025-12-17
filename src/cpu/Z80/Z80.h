@@ -7,11 +7,16 @@
 /**                                                         **/
 /** Copyright (C) Marat Fayzullin 1994-2007                 **/
 /**     You are not allowed to distribute this software     **/
-/**     commercially. Please, notify me, if you make any    **/   
+/**     commercially. Please, notify me, if you make any    **/
 /**     changes to this file.                               **/
 /*************************************************************/
 #ifndef Z80_H
 #define Z80_H
+
+ #include <stdint.h>
+
+
+#define  EXECZ80 // run a few cycles
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,8 +24,8 @@ extern "C" {
 
                                /* Compilation options:       */
 /* #define DEBUG */            /* Compile debugging version  */
-/* #define LSB_FIRST */        /* Compile for low-endian CPU */
-/* #define MSB_FIRST */        /* Compile for hi-endian CPU  */
+#define LSB_FIRST         /* Compile for low-endian CPU */
+// #define MSB_FIRST         /* Compile for hi-endian CPU  */
 
                                /* LoopZ80() may return:      */
 #define INT_RST00   0x00C7     /* RST 00h                    */
@@ -58,13 +63,13 @@ extern "C" {
 /*************************************************************/
 #ifndef BYTE_TYPE_DEFINED
 #define BYTE_TYPE_DEFINED
-typedef unsigned char byte;
+typedef uint8_t byte;
 #endif
 #ifndef WORD_TYPE_DEFINED
 #define WORD_TYPE_DEFINED
-typedef unsigned short word;
+typedef uint16_t word;
 #endif
-typedef signed char offset;
+typedef int8_t offset;
 
 /** Structured Datatypes *************************************/
 /** NOTICE: #define LSB_FIRST for machines where least      **/
@@ -103,7 +108,7 @@ typedef struct
 /** starting execution with RunZ80(). It sets registers to  **/
 /** their initial values.                                   **/
 /*************************************************************/
-void ResetZ80(register Z80 *R);
+void ResetZ80(register Z80 *R, register int Cycles);
 
 /** ExecZ80() ************************************************/
 /** This function will execute given number of Z80 cycles.  **/
