@@ -653,7 +653,7 @@ if ((y>v_border_top)&&(y<(v_border_top+SPECTRUM_SCREEN_HEIGHT)))
     screen_buffer[col++] = getPaletteColor( ((pixeles & 0x01) ? tinta : papel) );
   }
 } else {
-	for (x = 0; x < (32*8); x++)
+	for (x = 0; x < (256); x++)
   {
 		screen_buffer[col++] = getPaletteColor( bordercolor );
   }
@@ -670,11 +670,19 @@ static int f_flash = 1, f_flash2 = 0;
 void displayScreen(void) {
   int y;
   
-  f_flash2 = (f_flash2++) % 32;
+  /*f_flash2 = (f_flash2++) % 32;
   if (f_flash2 < 16)
     f_flash = 1;
   else
     f_flash = 0;
+*/
+	f_flash2++;
+	if (f_flash2==32)
+	{
+		f_flash2=0;
+		f_flash=!f_flash;
+	}
+
 
   int _tot_pant = v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom;
   
