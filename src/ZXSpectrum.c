@@ -1,7 +1,7 @@
 //================================================================
 //                                                              //
 // ZXtiny emulator                                              //
-// Copyright (C) by Chuso 2025.                                 //
+// Copyright (C) by Chuso 2025.									//
 //                                                              //
 //================================================================
 
@@ -12,6 +12,8 @@
 #include <stdbool.h>
 
 #include "cpu/Z80/Z80.h"
+
+//#define EXECZ80
 
 typedef uint32_t u32;
 
@@ -26,7 +28,8 @@ SDL_Texture* texture = NULL;
 #define CYCLES_PER_STEP (CYCLES_PER_FRAME/NBLINES)
 
 float _SCALE = 1;
-int v_border=0;
+#define v_border_top 48 //visible 48
+#define v_border_bottom 56
 #define h_border 32
 uint32_t bordercolor=0;
 
@@ -65,7 +68,7 @@ void text_at(const char *str, word x, byte y);
 Z80 R;
 byte MEMORY[65536]; // max 64k of MEMORY
 
-uint32_t screen_buffer[SPECTRUM_SCREEN_HEIGHT * (h_border+SPECTRUM_SCREEN_WIDTH+h_border)];
+uint32_t screen_buffer[(v_border_top+SPECTRUM_SCREEN_HEIGHT+v_border_bottom) * (h_border+SPECTRUM_SCREEN_WIDTH+h_border)];
 
 byte Fassst;
 byte ExitLoop;
@@ -602,7 +605,7 @@ void displayscanline(int y, int f_flash)
 {
   int x, row, col, dir_p, dir_a, pixeles, tinta, papel, atributos;
 
-  row = y + v_border;    // 4 & 32 = graphical screen offset
+  row = y /*+ v_border_top*/;    // 4 & 32 = graphical screen offset
   col = (y*(h_border + SPECTRUM_SCREEN_WIDTH + h_border));              // 32+256+32=320  4+192+4=200  (res=320x200)
 	//col = y*320;
 
@@ -610,9 +613,12 @@ void displayscanline(int y, int f_flash)
     screen_buffer[col++] = getPaletteColor(bordercolor);
   }
 
+if ((y>v_border_top)&&(y<(v_border_top+SPECTRUM_SCREEN_HEIGHT)))
+{
 
-  dir_p = ((y & 0xC0) << 5) + ((y & 0x07) << 8) + ((y & 0x38) << 2) +0x4000;
-  dir_a = 0x1800 + (32 * (y >> 3)) +0x4000;
+
+  dir_p = (((y-v_border_top) & 0xC0) << 5) + (((y-v_border_top) & 0x07) << 8) + (((y-v_border_top) & 0x38) << 2) +0x4000;
+  dir_a = 0x1800 + (32 * ((y-v_border_top) >> 3)) +0x4000;
   //printf("Pixel: %d\n",dir_p);
 
   //dir_p = get_pixel_address(0, y)+0x4000;
@@ -646,7 +652,12 @@ void displayscanline(int y, int f_flash)
     screen_buffer[col++] = getPaletteColor( ((pixeles & 0x02) ? tinta : papel) );
     screen_buffer[col++] = getPaletteColor( ((pixeles & 0x01) ? tinta : papel) );
   }
-
+} else {
+	for (x = 0; x < (32*8); x++)
+  {
+		screen_buffer[col++] = getPaletteColor( bordercolor );
+  }
+}
 
   for (x = 0; x < h_border; x++) {
     screen_buffer[col++] = getPaletteColor( bordercolor );
@@ -664,8 +675,10 @@ void displayScreen(void) {
     f_flash = 1;
   else
     f_flash = 0;
+
+  int _tot_pant = v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom;
   
-  for (y = 0; y < SPECTRUM_SCREEN_HEIGHT; y++){
+  for (y = 0; y < _tot_pant; y++){
     ExecZ80(&R,224);
 	displayscanline (y, f_flash);
   }
@@ -801,7 +814,7 @@ void update_screen(void) {
   if (SDL_LockTexture(texture, NULL, &pixels, &pitch) != 0) {
     SDL_Log("Unable to lock texture: %s", SDL_GetError());
   } else {
-    SDL_memcpy(pixels, screen_buffer, pitch * SPECTRUM_SCREEN_HEIGHT);
+    SDL_memcpy(pixels, screen_buffer, pitch * (v_border_top+SPECTRUM_SCREEN_HEIGHT+v_border_bottom));
   }
   SDL_UnlockTexture(texture);
 }
@@ -856,13 +869,13 @@ word new_LoopZ80(Z80 *R)
                 // Handle up key
 				_SCALE+=0.5;
 				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
-				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, (v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom)*_SCALE);
                 break;
             case SDLK_DOWN:
                 // Handle down key
 				_SCALE-=0.5;
 				SDL_RenderSetScale(renderer, _SCALE, _SCALE);
-				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, SPECTRUM_SCREEN_HEIGHT*_SCALE);
+				SDL_SetWindowSize(window, (h_border + SPECTRUM_SCREEN_WIDTH + h_border)*_SCALE, (v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom)*_SCALE);
                 break;
 
             case SDLK_ESCAPE:
@@ -1005,7 +1018,7 @@ void usage(char *arg0)
 int main(int argc, char **argv)
 {
     int sizeX = (h_border + SPECTRUM_SCREEN_WIDTH + h_border);
-    int sizeY = WINDOW_H;
+    int sizeY = (v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom);
     //int i;
     //char *ptr;
     //int font_color = 0;
@@ -1047,7 +1060,7 @@ int main(int argc, char **argv)
         return -1;
     }
 
-	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, h_border+SPECTRUM_SCREEN_WIDTH+h_border, SPECTRUM_SCREEN_HEIGHT);
+	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, h_border+SPECTRUM_SCREEN_WIDTH+h_border, (v_border_top + SPECTRUM_SCREEN_HEIGHT + v_border_bottom));
 	if (texture == NULL) {
 		SDL_Log("Unable to create texture: %s", SDL_GetError());
 		return 1;
