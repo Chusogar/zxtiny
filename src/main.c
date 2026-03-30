@@ -50,6 +50,7 @@ static void send_quit_event() {
 
 static void screenshot(spectrum* const p) {
 	printf("Saving...");
+
   // generate filename
   time_t t = time(NULL);
   struct tm tm = *localtime(&t);
@@ -61,6 +62,7 @@ static void screenshot(spectrum* const p) {
 
   // if file already exists, we don't want to erase it
   FILE* f = fopen(filename, "r");
+#if 0
   if (f != NULL) {
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
         "Cannot save screenshot: file %s already exists", filename);
@@ -69,12 +71,12 @@ static void screenshot(spectrum* const p) {
     return;
   }
   fclose(f);
-
+#endif
   // render screen buffer to BMP file
   const uint32_t pitch = sizeof(uint8_t) * SPECTRUM_SCREEN_WIDTH;
   const uint8_t depth = 32;
   SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(p->screen_buffer,
-      SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT, depth, pitch, SDL_PIXELFORMAT_RGB24);
+      SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT, depth*4, pitch*4, SDL_PIXELFORMAT_ARGB8888);
   SDL_SaveBMP(s, filename);
   SDL_FreeSurface(s);
 

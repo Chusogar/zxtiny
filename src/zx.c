@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <string.h>
-#include "cpu/jgz80/z80.h"  // from https://github.com/carmiker/jgz80
+#include "cpu/Z80/jgz80/z80.h"  // from https://github.com/carmiker/jgz80
 
 #define SCREEN_WIDTH  256
 #define SCREEN_HEIGHT 192
@@ -265,23 +265,23 @@ static int pos = 0;
 
 void generate_beeper(int t) {
     int samples = SAMPLE_RATE / 50;
-    /*for (int i = 0; i < samples; i++) {
+    for (int i = 0; i < samples; i++) {
         audio_buffer[i] = beeper_state ? 8000 : -8000;
-    }*/
+    }
 	if (pos<samples)
 	{
 		audio_buffer[pos++] = beeper_state ? 8000 : -8000;
 	} else {
 		pos = 0;
 	}
-	
-	/*tstate_acc += t;
+	/*
+	tstate_acc += t;
     int step = CPU_FREQ / AUDIO_FREQ;
     while(tstate_acc >= step){
         tstate_acc -= step;
         audio_buffer[pos++] = beeper ? 8000 : -8000;
         if(pos==1024){
-            SDL_QueueAudio(audio_dev,buf,2048);
+            SDL_QueueAudio(audio_dev,audio_buffer,pos);
             pos=0;
         }
     }*/
@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
     audio_spec.format = AUDIO_S16SYS;
     audio_spec.channels = 1;
     audio_spec.samples = 1024;
-    audio_spec.callback = audio_callback;
+    audio_spec.callback = NULL; //audio_callback;
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &audio_spec, NULL, 0);
     SDL_PauseAudioDevice(audio_dev, 0);
 
@@ -495,6 +495,7 @@ int main(int argc, char** argv) {
 
 		if (cycles_done >= CYCLES_PER_FRAME)
 		{
+			SDL_QueueAudio(audio_dev,audio_buffer,pos);
 			_num_frames++;
 			cycles_done = 0;
 			if (_num_frames == 32)

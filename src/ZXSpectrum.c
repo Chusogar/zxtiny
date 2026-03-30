@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 
-#include "cpu/Z80/Z80.h"
+#include "cpu/Z80/Z80/Z80.h"
 
 //#define EXECZ80
 

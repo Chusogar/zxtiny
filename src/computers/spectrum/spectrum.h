@@ -1,23 +1,55 @@
 #ifndef EMU_SPECTRUM_H
 #define EMU_SPECTRUM_H
 
+#define Z80_JGZ80
+//#define Z80_SZ_Z80
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
-#include "../../cpu/jgz80/z80.h"
+
+#ifdef Z80_JGZ80
+#include "../../cpu/Z80/jgz80/z80.h"
+#endif
+
+#ifdef Z80_SZ_Z80
+#include "../../cpu/Z80/sz80/z80.h"
+#endif
+
 //#include "wsg.h"
 
-#define SPECTRUM_CLOCK_SPEED 3072000 // 3.072 MHz (= number of cycles per second)
+#define SPECTRUM_CLOCK_SPEED 3500000 // 3.072 MHz (= number of cycles per second)
 #define SPECTRUM_FPS 60
 #define SPECTRUM_CYCLES_PER_FRAME (SPECTRUM_CLOCK_SPEED / SPECTRUM_FPS)
 #define SPECTRUM_SCREEN_WIDTH	256
 #define SPECTRUM_SCREEN_HEIGHT	192
 
+// Audio
+#define SPECTRUM_SAMPLE_RATE 44100
+#define SPECTRUM_SAMPLES_PER_TSTATE (SPECTRUM_SAMPLE_RATE / SPECTRUM_CLOCK_SPEED)
+#define SPECTRUM_LENGHT_AUDIO_FRAME (SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS)
+
+
+
+/*struct z80_cpu {
+
+#ifdef Z80_JGZ80
+#define Z80 z80;
+#endif
+
+#ifdef Z80_SZ_Z80
+#define z80 z80;
+#endif
+
+};*/
+
 typedef struct spectrum spectrum;
 struct spectrum {
+
   z80 cpu;
+
   uint8_t rom[0x4000]; // 0x0000-0x4000
   uint8_t ram[0xC000]; // 0x4000-0xffff
   //uint8_t sprite_pos[0x10]; // 0x5060-0x506f
@@ -59,6 +91,7 @@ struct spectrum {
   int sample_rate;
   bool mute_audio;
   //void (*push_sample)(pac* const n, int16_t);
+  int audio_frame_pos;
 };
 
 int spectrum_init(spectrum* const p, const char* rom_dir);

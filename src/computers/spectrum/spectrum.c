@@ -1,4 +1,5 @@
 #include "spectrum.h"
+#include <SDL.h>
 
 bool _keyboard_state[1024] = {false};
 
@@ -56,7 +57,7 @@ static void wb(void* userdata, uint16_t addr, uint8_t val) {
 static uint8_t readKeyboard(uint16_t port)
 {
 	int ret = 0xff;
-#if 0
+#if 1
 	if ((port & 0x0100) == 0) {
 		//ret &= (isKeyDown(KeyEvent.VK_SHIFT)) ? ~1 : 255;
 		ret &= (_keyboard_state[SDL_SCANCODE_LSHIFT]) ? ~1 : 255;
@@ -160,6 +161,60 @@ static uint8_t readKeyboard(uint16_t port)
 	return ret;
 }
 
+#ifdef Z80_JGZ80
+static uint8_t port_in(z80* const z, uint16_t port) {
+	uint8_t hiport = port >> 8;
+	uint8_t loport = port & 0xFF;
+
+	uint8_t result = 0xff;
+
+	
+	if ((port & 1) == 0) { // ULA
+		//result &= readKeyboard(port) /*& _last_read<<2*/ & 0xBF; // abu simbel now works!
+		//return result;
+	}
+
+	if (loport == 0xFE) {
+		result = 0xBF;
+
+		// EAR_PIN
+		if (hiport == 0xFE) {
+//#ifdef EAR_PRESENT
+//			bitWrite(result, 6, digitalRead(EAR_PIN));
+//#endif
+		}
+
+		// Keyboard
+		//if (~(portHigh | 0xFE) & 0xFF) result &= (Ports::base[0] & Ports::wii[0]);
+		//if (~(portHigh | 0xFD) & 0xFF) result &= (Ports::base[1] & Ports::wii[1]);
+		//if (~(portHigh | 0xFB) & 0xFF) result &= (Ports::base[2] & Ports::wii[2]);
+		//if (~(portHigh | 0xF7) & 0xFF) result &= (Ports::base[3] & Ports::wii[3]);
+		//if (~(portHigh | 0xEF) & 0xFF) result &= (Ports::base[4] & Ports::wii[4]);
+		//if (~(portHigh | 0xDF) & 0xFF) result &= (Ports::base[5] & Ports::wii[5]);
+		//if (~(portHigh | 0xBF) & 0xFF) result &= (Ports::base[6] & Ports::wii[6]);
+		//if (~(portHigh | 0x7F) & 0xFF) result &= (Ports::base[7] & Ports::wii[7]);
+
+		result &= readKeyboard(port) & 0xBF;
+
+		
+
+		return result;
+	}
+  return 0xff;
+}
+
+static void port_out(z80* const z, uint16_t port, uint8_t val) {
+	printf("OUT: %02x at %d\n", val, port);
+  spectrum* const p = (spectrum*) z->userdata;
+
+  // setting the interrupt vector
+  if (port == 0) {
+    p->int_vector = val;
+  }
+}
+#endif
+
+#ifdef Z80_SZ_Z80
 static uint8_t port_in(z80* const z, uint8_t port) {
 	uint8_t hiport = port >> 8;
 	uint8_t loport = port & 0xFF;
@@ -210,6 +265,7 @@ static void port_out(z80* const z, uint8_t port, uint8_t val) {
     p->int_vector = val;
   }
 }
+#endif
 
 // appends two NULL-terminated strings, creating a new string in the process.
 // The pointer returned is owned by the user.
@@ -356,10 +412,14 @@ static inline void sound_update(spectrum* const p) {
     int pos = d * (float) i;
     p->push_sample(p, p->audio_buffer[pos]);
   }*/
+
+  
 }
 
 int spectrum_init(spectrum* const p, const char* rom_dir) {
+
   z80_init(&p->cpu);
+
   p->cpu.userdata = p;
   p->cpu.read_byte = rb;
   p->cpu.write_byte = wb;
@@ -374,6 +434,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   p->int_vector = 0;
   p->vblank_enabled = 1;
   p->sound_enabled = 0;
+  p->audio_frame_pos = 0;
   p->flip_screen = 0;
 
   // in 0 port
@@ -435,7 +496,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
 
   // audio
   //wsg_init(&p->sound_chip, p->sound_rom1);
-  //p->audio_buffer_len = WSG_SAMPLE_RATE / PAC_FPS;
+  p->audio_buffer_len = SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS;
   p->audio_buffer_len = 0xffff;
   p->audio_buffer = calloc(p->audio_buffer_len, sizeof(int16_t));
   p->sample_rate = 44100;
@@ -457,13 +518,16 @@ void spectrum_quit(spectrum* const p) {
   free(p->audio_buffer);
 }
 
+int cpu_cyc = 0;
+
 // updates emulation for "ms" milliseconds.
 void spectrum_update(spectrum* const p, unsigned int ms) {
   // machine executes exactly PAC_CLOCK_SPEED cycles every second,
   // so we need to execute "ms * PAC_CLOCK_SPEED / 1000"
   int count = 0;
   while (count < ms * SPECTRUM_CLOCK_SPEED / 1000) {
-    int cyc = p->cpu.cyc;
+#ifdef Z80_SZ_Z80
+	int cyc = p->cpu.cyc;
     z80_step(&p->cpu);
     int elapsed = p->cpu.cyc - cyc;
     count += elapsed;
@@ -481,6 +545,29 @@ void spectrum_update(spectrum* const p, unsigned int ms) {
         sound_update(p);
       }
     }
+#endif
+
+#ifdef Z80_JGZ80
+	int cyc = cpu_cyc;
+    cpu_cyc += z80_step(&p->cpu);
+    int elapsed = cpu_cyc - cyc;
+    count += elapsed;
+
+    if (cpu_cyc >= SPECTRUM_CYCLES_PER_FRAME) {
+      cpu_cyc -= SPECTRUM_CYCLES_PER_FRAME;
+
+      // trigger vblank if enabled:
+      if (p->vblank_enabled) {
+        // p->vblank_enabled = 0;
+        z80_pulse_irq(&p->cpu, 1);
+
+        spectrum_draw(p);
+        p->update_screen(p);
+        sound_update(p);
+      }
+    }
+#endif
+
   }
 }
 
