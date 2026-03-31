@@ -51,6 +51,8 @@ struct spectrum {
   z80 cpu;
 
   uint8_t border_color;
+  uint8_t last_fe_write;
+  uint8_t current_speaker_level;
 
   uint8_t keyboard[8];
 
@@ -94,7 +96,7 @@ struct spectrum {
   int16_t* audio_buffer;
   int sample_rate;
   bool mute_audio;
-  //void (*push_sample)(pac* const n, int16_t);
+  void (*push_sample)(spectrum* const n, int16_t);
   int audio_frame_pos;
 };
 
@@ -103,6 +105,7 @@ uint32_t getPaletteColor(int color);
 void spectrum_quit(spectrum* const p);
 void spectrum_update(spectrum* const p, unsigned int ms);
 void init_palette(spectrum* const p);
+void spectrum_key_press(void* userdata, int _key_code, bool _pressed);
 
 //void pac_cheat_invincibility(pac* const p);
 

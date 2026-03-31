@@ -54,6 +54,64 @@ static void wb(void* userdata, uint16_t addr, uint8_t val) {
   }
 }
 
+void spectrum_key_press(void* userdata, int _key_code, bool _pressed) {
+	spectrum* const p = (spectrum*) userdata;
+
+	int row = -1, bit = -1;
+
+	switch (_key_code) {
+		
+		// Resto Teclas
+		case SDLK_a:     row=1; bit=0; break;
+		case SDLK_b:     row=7; bit=4; break;
+		case SDLK_c:     row=0; bit=3; break;
+		case SDLK_d:     row=1; bit=2; break;
+		case SDLK_e:     row=2; bit=2; break;
+		case SDLK_f:     row=1; bit=3; break;
+		case SDLK_g:     row=1; bit=4; break;
+		case SDLK_h:     row=6; bit=4; break;
+		case SDLK_i:     row=5; bit=2; break;
+		case SDLK_j:     row=6; bit=3; break;
+		case SDLK_k:     row=6; bit=2; break;
+		case SDLK_l:     row=6; bit=1; break;
+		case SDLK_m:     row=7; bit=2; break;
+		case SDLK_n:     row=7; bit=3; break;
+		case SDLK_o:     row=5; bit=1; break;
+		case SDLK_p:     row=5; bit=0; break;
+		case SDLK_q:     row=2; bit=0; break;
+		case SDLK_r:     row=2; bit=3; break;
+		case SDLK_s:     row=1; bit=1; break;
+		case SDLK_t:     row=2; bit=4; break;
+		case SDLK_u:     row=5; bit=3; break;
+		case SDLK_v:     row=0; bit=4; break;
+		case SDLK_w:     row=2; bit=1; break;
+		case SDLK_x:     row=0; bit=2; break;
+		case SDLK_y:     row=5; bit=4; break;
+		case SDLK_z:     row=0; bit=1; break;
+		case SDLK_0:     row=4; bit=0; break;
+		case SDLK_1:     row=3; bit=0; break;
+		case SDLK_2:     row=3; bit=1; break;
+		case SDLK_3:     row=3; bit=2; break;
+		case SDLK_4:     row=3; bit=3; break;
+		case SDLK_5:     row=3; bit=4; break;
+		case SDLK_6:     row=4; bit=4; break;
+		case SDLK_7:     row=4; bit=3; break;
+		case SDLK_8:     row=4; bit=2; break;
+		case SDLK_9:     row=4; bit=1; break;
+		case SDLK_SPACE: row=7; bit=0; break;
+		case SDLK_RETURN:row=6; bit=0; break;
+		case SDLK_LSHIFT:
+		case SDLK_RSHIFT: row=0; bit=0; break; // Caps Shift
+		case SDLK_LCTRL:
+		case SDLK_RCTRL:  row=7; bit=1; break; // Symbol Shift
+	}
+
+	if (row >= 0 && bit >= 0) {
+		if (_pressed)	p->keyboard[row] &= ~(1 << bit);
+		else			p->keyboard[row] |=  (1 << bit);
+	}
+}
+
 
 #ifdef Z80_JGZ80
 static uint8_t port_in(z80* const z, uint16_t port) {
@@ -79,9 +137,40 @@ static uint8_t port_in(z80* const z, uint16_t port) {
   return res;
 }
 
+int _posi_audio = 0;
+
+static void add_sound_states(z80* const z, int _numS) {
+	spectrum* const p = (spectrum*) z->userdata;
+
+	for (int _i=0 ; _i<_numS ; _i++ )
+		  {
+				_posi_audio++;
+				if (_posi_audio>=512)
+				{
+					_posi_audio = 0;
+				}
+			  p->audio_buffer[_posi_audio] = p->current_speaker_level ? 8000 : -8000;
+		  }
+}
+
 static void port_out(z80* const z, uint16_t port, uint8_t val) {
 	//printf("OUT: %02x at %d\n", val, port);
   spectrum* const p = (spectrum*) z->userdata;
+
+  if ((port & 1) == 0) {
+        p->border_color   = val & 0x07;
+        p->last_fe_write  = val;
+        
+        // Antes de cambiar el valor, generamos el audio con el nivel anterior
+        // hasta el momento exacto del cambio (t_states actuales)
+        //generate_audio(cycles_done, false); 
+        
+        // El bit 4 controla el altavoz
+        p->current_speaker_level = (val & 0x10) ? 1 : 0;
+		//add_sound_states(&p->cpu, 1);
+		p->push_sample(p, p->current_speaker_level ? 8000 : -8000);
+		
+    }
 
   // setting the interrupt vector
   if (port == 0) {
@@ -115,6 +204,20 @@ static uint8_t port_in(z80* const z, uint8_t port) {
 static void port_out(z80* const z, uint8_t port, uint8_t val) {
 	printf("OUT: %02x at %d\n", val, port);
   spectrum* const p = (spectrum*) z->userdata;
+
+  if ((port & 1) == 0) {
+        p->border_color   = val & 0x07;
+        p->last_fe_write  = val;
+        
+        // Antes de cambiar el valor, generamos el audio con el nivel anterior
+        // hasta el momento exacto del cambio (t_states actuales)
+        //generate_audio(cycles_done, false); 
+        
+        // El bit 4 controla el altavoz
+        p->current_speaker_level = (val & 0x10) ? 1 : 0;
+		//add_sound_states(&p->cpu, 1);
+		p->push_sample(p, p->current_speaker_level ? 12000 : -12000);
+    }
 
   // setting the interrupt vector
   if (port == 0) {
@@ -259,15 +362,20 @@ static inline void sound_update(spectrum* const p) {
     return;
   }
 
+  /*for (int _i=0 ; _i<512 ; _i++ )
+  {
+	  p->audio_buffer[_i] = p->current_speaker_level ? 8000 : -8000;
+  }*/
+
   // update the WSG (filling the audio buffer)
   //wsg_play(&p->sound_chip, p->audio_buffer, p->audio_buffer_len);
 
   // resampling the 96kHz audio stream from the WSG into a 44.1kHz one
-  /*float d = (float) WSG_SAMPLE_RATE / (float) p->sample_rate;
+  float d = (float) SPECTRUM_SAMPLE_RATE / (float) p->sample_rate;
   for (int i = 0; i < p->sample_rate / SPECTRUM_FPS; i++) {
     int pos = d * (float) i;
     p->push_sample(p, p->audio_buffer[pos]);
-  }*/
+  }
 
   
 }
@@ -340,7 +448,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
 
   p->int_vector = 0;
   p->vblank_enabled = 1;
-  p->sound_enabled = 0;
+  p->sound_enabled = 1;
   p->audio_frame_pos = 0;
   p->flip_screen = 0;
 
@@ -362,6 +470,7 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   // loading rom files
   int r = 0;
   char* file0 = append_path(rom_dir, "spectrum.rom");
+  printf("Ruta Total: %s\n", file0);
   r += load_file(file0, &p->rom[0x0000], 0x4000);
   //char* file1 = append_path(rom_dir, "pacman.6f");
   //r += load_file(file1, &p->rom[0x1000], 0x1000);
@@ -404,11 +513,11 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   // audio
   //wsg_init(&p->sound_chip, p->sound_rom1);
   p->audio_buffer_len = SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS;
-  p->audio_buffer_len = 0xffff;
+  //p->audio_buffer_len = 0xffff;
   p->audio_buffer = calloc(p->audio_buffer_len, sizeof(int16_t));
   p->sample_rate = 44100;
   p->mute_audio = false;
-  //p->push_sample = NULL;
+  p->push_sample = NULL;
 
   return r != 0;
 }
@@ -449,14 +558,16 @@ void spectrum_update(spectrum* const p, unsigned int ms) {
 
         spectrum_draw(p);
         p->update_screen(p);
-        sound_update(p);
+		//add_sound_states(p, p->cpu.cyc);
+        //sound_update(p);
       }
     }
 #endif
 
 #ifdef Z80_JGZ80
 	int cyc = cpu_cyc;
-    cpu_cyc += z80_step(&p->cpu);
+	int _cyc_done = z80_step(&p->cpu);
+    cpu_cyc += _cyc_done;
     int elapsed = cpu_cyc - cyc;
     count += elapsed;
 
@@ -470,7 +581,8 @@ void spectrum_update(spectrum* const p, unsigned int ms) {
 
         spectrum_draw(p);
         p->update_screen(p);
-        sound_update(p);
+		//add_sound_states(&p->cpu, _cyc_done);
+        //sound_update(p);
       }
     }
 #endif

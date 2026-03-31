@@ -86,6 +86,16 @@ static void screenshot(spectrum* const p) {
   SDL_free(filename);
 }
 
+static inline char* append_path(const char* s1, const char* s2) {
+  const int buf_size = strlen(s1) + strlen(s2) + 1;
+  char* path = calloc(buf_size, sizeof(char));
+  if (path == NULL) {
+    return NULL;
+  }
+  snprintf(path, buf_size, "%s%s", s1, s2);
+  return path;
+}
+
 static void mainloop(void) {
   current_time = SDL_GetTicks();
   dt = current_time - last_time;
@@ -102,87 +112,32 @@ static void mainloop(void) {
       }
     } else if ((e.type == SDL_KEYUP) || (e.type == SDL_KEYDOWN)) {
 		bool press = (e.type == SDL_KEYDOWN);
-		int row = -1, bit = -1;
 
+		// Teclas Menu
 		switch (e.key.keysym.sym) {
-			// Teclas Menu
+			case SDLK_F1: 
+				if (press) { 
+					char* base_path = SDL_GetBasePath();
+					char* file0 = append_path(base_path, "commando.sna");
+					load_sna(p, file0); 
+				}
+			break;
+
 			case SDLK_F2: 
 				if (press) { 
 					screenshot(p); 
 				}
 			break;
-
-			// Resto Teclas
-			case SDLK_a:     row=1; bit=0; break;
-			case SDLK_b:     row=7; bit=4; break;
-			case SDLK_c:     row=0; bit=3; break;
-			case SDLK_d:     row=1; bit=2; break;
-			case SDLK_e:     row=2; bit=2; break;
-			case SDLK_f:     row=1; bit=3; break;
-			case SDLK_g:     row=1; bit=4; break;
-			case SDLK_h:     row=6; bit=4; break;
-			case SDLK_i:     row=5; bit=2; break;
-			case SDLK_j:     row=6; bit=3; break;
-			case SDLK_k:     row=6; bit=2; break;
-			case SDLK_l:     row=6; bit=1; break;
-			case SDLK_m:     row=7; bit=2; break;
-			case SDLK_n:     row=7; bit=3; break;
-			case SDLK_o:     row=5; bit=1; break;
-			case SDLK_p:     row=5; bit=0; break;
-			case SDLK_q:     row=2; bit=0; break;
-			case SDLK_r:     row=2; bit=3; break;
-			case SDLK_s:     row=1; bit=1; break;
-			case SDLK_t:     row=2; bit=4; break;
-			case SDLK_u:     row=5; bit=3; break;
-			case SDLK_v:     row=0; bit=4; break;
-			case SDLK_w:     row=2; bit=1; break;
-			case SDLK_x:     row=0; bit=2; break;
-			case SDLK_y:     row=5; bit=4; break;
-			case SDLK_z:     row=0; bit=1; break;
-			case SDLK_0:     row=4; bit=0; break;
-			case SDLK_1:     row=3; bit=0; break;
-			case SDLK_2:     row=3; bit=1; break;
-			case SDLK_3:     row=3; bit=2; break;
-			case SDLK_4:     row=3; bit=3; break;
-			case SDLK_5:     row=3; bit=4; break;
-			case SDLK_6:     row=4; bit=4; break;
-			case SDLK_7:     row=4; bit=3; break;
-			case SDLK_8:     row=4; bit=2; break;
-			case SDLK_9:     row=4; bit=1; break;
-			case SDLK_SPACE: row=7; bit=0; break;
-			case SDLK_RETURN:row=6; bit=0; break;
-			case SDLK_LSHIFT:
-			case SDLK_RSHIFT: row=0; bit=0; break; // Caps Shift
-			case SDLK_LCTRL:
-			case SDLK_RCTRL:  row=7; bit=1; break; // Symbol Shift
+			
+			case SDLK_F12: 
+				z80_reset(&p->cpu);
+			break;
 		}
-
-		if (row >= 0 && bit >= 0) {
-			if (press) p->keyboard[row] &= ~(1 << bit);
-			else       p->keyboard[row] |=  (1 << bit);
-		}
-	
-      switch (e.key.keysym.scancode) {
-      /*case SDL_SCANCODE_RETURN:
-      case SDL_SCANCODE_1: p->p1_start = 1; break; // start (1p)
-      case SDL_SCANCODE_2: p->p2_start = 1; break; // start (2p)
-      case SDL_SCANCODE_UP: p->p1_up = 1; break; // up
-      case SDL_SCANCODE_DOWN: p->p1_down = 1; break; // down
-      case SDL_SCANCODE_LEFT: p->p1_left = 1; break; // left
-      case SDL_SCANCODE_RIGHT: p->p1_right = 1; break; // right
-      case SDL_SCANCODE_C:
-      case SDL_SCANCODE_5: p->coin_s1 = 1; break; // coin
-      case SDL_SCANCODE_V: p->coin_s2 = 1; break; // coin (slot 2)
-      case SDL_SCANCODE_T: p->board_test = 1; break; // board test
-
-      case SDL_SCANCODE_M: p->mute_audio = !p->mute_audio; break;
-      case SDL_SCANCODE_P: is_paused = !is_paused; break;*/
-      
-      /*case SDL_SCANCODE_I: pac_cheat_invincibility(p); break;
-      case SDL_SCANCODE_TAB: speed = 5; break;*/
-      default: break;
-      }
-    } 
+		
+		// Teclas del ZX Spectrum
+		spectrum_key_press(p, e.key.keysym.sym, press);
+		
+	} 
   }
 
   if (!is_paused && has_focus) {
@@ -297,7 +252,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   p->sample_rate = audio_spec.freq;
-  //p->push_sample = push_sample;
+  p->push_sample = push_sample;
   p->update_screen = update_screen;
   update_screen(p);
 
