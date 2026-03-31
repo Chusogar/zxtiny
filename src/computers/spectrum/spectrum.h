@@ -50,6 +50,8 @@ struct spectrum {
 
   z80 cpu;
 
+  uint8_t border_color;
+
   uint8_t rom[0x4000]; // 0x0000-0x4000
   uint8_t ram[0xC000]; // 0x4000-0xffff
   //uint8_t sprite_pos[0x10]; // 0x5060-0x506f
@@ -101,5 +103,7 @@ void spectrum_update(spectrum* const p, unsigned int ms);
 void init_palette(spectrum* const p);
 
 //void pac_cheat_invincibility(pac* const p);
+
+bool load_sna(spectrum* const p, const char* filename);
 
 #endif // EMU_SPECTRUM_H

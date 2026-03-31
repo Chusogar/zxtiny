@@ -204,7 +204,7 @@ static uint8_t port_in(z80* const z, uint16_t port) {
 }
 
 static void port_out(z80* const z, uint16_t port, uint8_t val) {
-	printf("OUT: %02x at %d\n", val, port);
+	//printf("OUT: %02x at %d\n", val, port);
   spectrum* const p = (spectrum*) z->userdata;
 
   // setting the interrupt vector
@@ -416,6 +416,50 @@ static inline void sound_update(spectrum* const p) {
   
 }
 
+// ─────────────────────────────────────────────────────────────
+// Carga de snapshot .sna (48K)
+// ─────────────────────────────────────────────────────────────
+bool load_sna(spectrum* const p, const char* filename) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) { fprintf(stderr, "No se pudo abrir .sna: %s\n", filename); return false; }
+
+    uint8_t header[27];
+    if (fread(header, 1, 27, f) != 27) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (header)\n"); return false; }
+
+    // Restaurar registros Z80 (formato .sna 48K)
+    p->cpu.i      = header[0];
+    p->cpu.h_l_   = (header[2] << 8) | header[1];
+    p->cpu.d_e_   = (header[4] << 8) | header[3];
+    p->cpu.b_c_   = (header[6] << 8) | header[5];
+    p->cpu.a_f_   = (header[8] << 8) | header[7];
+    p->cpu.hl     = (header[10] << 8) | header[9];
+    p->cpu.de     = (header[12] << 8) | header[11];
+    p->cpu.bc     = (header[14] << 8) | header[13];
+    p->cpu.iy     = (header[16] << 8) | header[15];
+    p->cpu.ix     = (header[18] << 8) | header[17];
+    p->cpu.iff2   = header[19] ? 1 : 0;
+    p->cpu.r      = header[20];
+    p->cpu.af     = (header[22] << 8) | header[21];
+    p->cpu.sp     = (header[24] << 8) | header[23];
+    p->cpu.interrupt_mode = header[25];
+    p->border_color = header[26] & 0x07;
+
+    if (fread(&p->ram[0], 1, 49152, f) != 49152) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); return false; }
+    fclose(f);
+
+    uint16_t sp = p->cpu.sp;
+    p->cpu.pc = (p->cpu.read_byte(p, sp+1) << 8) | p->cpu.read_byte(p, sp);
+    p->cpu.sp += 2;
+
+    p->cpu.iff1 = p->cpu.iff2;
+
+    printf("Snapshot .sna cargado: %s\n", filename);
+    printf("PC=0x%04X  SP=0x%04X  Border=%d  IM=%d\n", p->cpu.pc, p->cpu.sp, p->border_color, p->cpu.interrupt_mode);
+
+    return true;
+}
+
+
 int spectrum_init(spectrum* const p, const char* rom_dir) {
 
   z80_init(&p->cpu);
@@ -425,6 +469,8 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   p->cpu.write_byte = wb;
   p->cpu.port_in = port_in;
   p->cpu.port_out = port_out;
+
+  p->border_color   = 7;
 
   memset(p->rom, 0, sizeof(p->rom));
   memset(p->ram, 0, sizeof(p->ram));

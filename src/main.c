@@ -19,6 +19,8 @@ static bool has_focus = true;
 static bool is_paused = false;
 static int speed = 1;
 
+static int _SCALE_ = 2;
+
 static SDL_Renderer* renderer = NULL;
 static SDL_Texture* texture = NULL;
 static SDL_GameController* controller = NULL;
@@ -167,7 +169,7 @@ int main(int argc, char** argv) {
 
   // create SDL window
   SDL_Window* window = SDL_CreateWindow("ZXtiny", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH, SPECTRUM_SCREEN_HEIGHT,
+      SDL_WINDOWPOS_CENTERED, SPECTRUM_SCREEN_WIDTH * _SCALE_, SPECTRUM_SCREEN_HEIGHT * _SCALE_,
       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 
   if (window == NULL) {
@@ -244,7 +246,8 @@ int main(int argc, char** argv) {
     argc -= 1;
     argv += 1;
   }
-  char* rom_dir = argc > 1 ? argv[1] : base_path;
+  //char* rom_dir = argc > 1 ? argv[1] : base_path;
+  char* rom_dir = base_path;
 
   p = SDL_calloc(1, sizeof(spectrum));
   if (spectrum_init(p, rom_dir) != 0) {
@@ -256,6 +259,17 @@ int main(int argc, char** argv) {
   //p->push_sample = push_sample;
   p->update_screen = update_screen;
   update_screen(p);
+
+  if (argc > 1) {
+        const char* ext = strrchr(argv[1], '.');
+        if (ext && strcasecmp(ext, ".tap") == 0) {
+            //load_tap(argv[1]);
+        } else if (ext && strcasecmp(ext, ".sna") == 0) {
+            load_sna(p, argv[1]);
+        } else if (ext && strcasecmp(ext, ".tzx") == 0) {
+            //load_tzx(argv[1]);
+        }
+    }
 
   SDL_free(base_path);
 
