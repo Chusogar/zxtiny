@@ -52,6 +52,8 @@ struct spectrum {
 
   uint8_t border_color;
 
+  uint8_t keyboard[8];
+
   uint8_t rom[0x4000]; // 0x0000-0x4000
   uint8_t ram[0xC000]; // 0x4000-0xffff
   //uint8_t sprite_pos[0x10]; // 0x5060-0x506f

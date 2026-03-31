@@ -1,7 +1,7 @@
 #include "spectrum.h"
 #include <SDL.h>
 
-bool _keyboard_state[1024] = {false};
+
 
 uint32_t spectrum_palette[16] = {
     0xff000000, /* negro */
@@ -54,153 +54,29 @@ static void wb(void* userdata, uint16_t addr, uint8_t val) {
   }
 }
 
-static uint8_t readKeyboard(uint16_t port)
-{
-	int ret = 0xff;
-#if 1
-	if ((port & 0x0100) == 0) {
-		//ret &= (isKeyDown(KeyEvent.VK_SHIFT)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_LSHIFT]) ? ~1 : 255;
-		////ret &= (isKeyDown(KEY_SHIFT)) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_Z)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_Z]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_X)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_X]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_C)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_C]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_V)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_V]) ? ~16 : 255;
-	}
-	if ((port & 0x0200) == 0) {
-		//ret &= (isKeyDown(KeyEvent.VK_A)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_A]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_S)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_S]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_D)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_D]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_F)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_F]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_G)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_G]) ? ~16 : 255;
-	}
-	if ((port & 0x0400) == 0) {
-		//ret &= (isKeyDown(KeyEvent.VK_Q)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_Q]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_W)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_W]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_E)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_E]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_R)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_R]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_T)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_T]) ? ~16 : 255;
-	}
-	if ((port & 0x0800) == 0) {                     
-		//ret &= (isKeyDown(KeyEvent.VK_1)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_1]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_2)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_2]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_3)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_3]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_4)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_4]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_5)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_5]) ? ~16 : 255;
-	}
-	if ((port & 0x1000) == 0) {                        
-		//ret &= (isKeyDown(KeyEvent.VK_0)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_0]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_9) || isKeyDown(KeyEvent.VK_UP)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_9]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_8) || isKeyDown(KeyEvent.VK_DOWN)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_8]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_7) || isKeyDown(KeyEvent.VK_RIGHT)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_7]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_6) || isKeyDown(KeyEvent.VK_LEFT)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_6]) ? ~16 : 255;
-	}
-	if ((port & 0x2000) == 0) {                      
-		//ret &= (isKeyDown(KeyEvent.VK_P)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_P]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_O)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_O]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_I)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_I]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_U)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_U]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_Y)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_U]) ? ~16 : 255;
-	}
-	if ((port & 0x4000) == 0) {                       
-		//ret &= (isKeyDown(KeyEvent.VK_ENTER)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_RETURN]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_L)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_L]) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_K)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_K]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_J)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_J]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_H)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_H]) ? ~16 : 255;
-	}
-	if ((port & 0x8000) == 0) {                     
-		//ret &= (isKeyDown(KeyEvent.VK_SPACE)) ? ~1 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_SPACE]) ? ~1 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_CONTROL)) ? ~2 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_LCTRL]) ? ~2 : 255;
-		////ret &= (isKeyDown(KEY_CTRL)) ? ~2 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_M)) ? ~4 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_M]) ? ~4 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_N)) ? ~8 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_N]) ? ~8 : 255;
-		//ret &= (isKeyDown(KeyEvent.VK_B)) ? ~16 : 255;
-		ret &= (_keyboard_state[SDL_SCANCODE_B]) ? ~16 : 255;
-		//std::cout << "PULSO! ";
-	}
-#endif	
-	return ret;
-}
 
 #ifdef Z80_JGZ80
 static uint8_t port_in(z80* const z, uint16_t port) {
+	spectrum* const p = (spectrum*) z->userdata;
+
 	uint8_t hiport = port >> 8;
 	uint8_t loport = port & 0xFF;
 
-	uint8_t result = 0xff;
+	uint8_t res = 0xff;
 
 	
 	if ((port & 1) == 0) { // ULA
-		//result &= readKeyboard(port) /*& _last_read<<2*/ & 0xBF; // abu simbel now works!
-		//return result;
+		res = 0xbf;
+        uint8_t hi = port >> 8;
+
+        // Teclado
+        for (int r = 0; r < 8; r++)
+            if ((hi & (1 << r)) == 0)
+                res &= p->keyboard[r];
 	}
 
-	if (loport == 0xFE) {
-		result = 0xBF;
-
-		// EAR_PIN
-		if (hiport == 0xFE) {
-//#ifdef EAR_PRESENT
-//			bitWrite(result, 6, digitalRead(EAR_PIN));
-//#endif
-		}
-
-		// Keyboard
-		//if (~(portHigh | 0xFE) & 0xFF) result &= (Ports::base[0] & Ports::wii[0]);
-		//if (~(portHigh | 0xFD) & 0xFF) result &= (Ports::base[1] & Ports::wii[1]);
-		//if (~(portHigh | 0xFB) & 0xFF) result &= (Ports::base[2] & Ports::wii[2]);
-		//if (~(portHigh | 0xF7) & 0xFF) result &= (Ports::base[3] & Ports::wii[3]);
-		//if (~(portHigh | 0xEF) & 0xFF) result &= (Ports::base[4] & Ports::wii[4]);
-		//if (~(portHigh | 0xDF) & 0xFF) result &= (Ports::base[5] & Ports::wii[5]);
-		//if (~(portHigh | 0xBF) & 0xFF) result &= (Ports::base[6] & Ports::wii[6]);
-		//if (~(portHigh | 0x7F) & 0xFF) result &= (Ports::base[7] & Ports::wii[7]);
-
-		result &= readKeyboard(port) & 0xBF;
-
-		
-
-		return result;
-	}
-  return 0xff;
+	
+  return res;
 }
 
 static void port_out(z80* const z, uint16_t port, uint8_t val) {
@@ -219,41 +95,21 @@ static uint8_t port_in(z80* const z, uint8_t port) {
 	uint8_t hiport = port >> 8;
 	uint8_t loport = port & 0xFF;
 
-	uint8_t result = 0xff;
+	uint8_t res = 0xff;
 
 	
 	if ((port & 1) == 0) { // ULA
-		//result &= readKeyboard(port) /*& _last_read<<2*/ & 0xBF; // abu simbel now works!
-		//return result;
+		res = 0xbf;
+        uint8_t hi = port >> 8;
+
+        // Teclado
+        for (int r = 0; r < 8; r++)
+            if ((hi & (1 << r)) == 0)
+                res &= keyboard[r];
 	}
 
-	if (loport == 0xFE) {
-		result = 0xBF;
-
-		// EAR_PIN
-		if (hiport == 0xFE) {
-//#ifdef EAR_PRESENT
-//			bitWrite(result, 6, digitalRead(EAR_PIN));
-//#endif
-		}
-
-		// Keyboard
-		//if (~(portHigh | 0xFE) & 0xFF) result &= (Ports::base[0] & Ports::wii[0]);
-		//if (~(portHigh | 0xFD) & 0xFF) result &= (Ports::base[1] & Ports::wii[1]);
-		//if (~(portHigh | 0xFB) & 0xFF) result &= (Ports::base[2] & Ports::wii[2]);
-		//if (~(portHigh | 0xF7) & 0xFF) result &= (Ports::base[3] & Ports::wii[3]);
-		//if (~(portHigh | 0xEF) & 0xFF) result &= (Ports::base[4] & Ports::wii[4]);
-		//if (~(portHigh | 0xDF) & 0xFF) result &= (Ports::base[5] & Ports::wii[5]);
-		//if (~(portHigh | 0xBF) & 0xFF) result &= (Ports::base[6] & Ports::wii[6]);
-		//if (~(portHigh | 0x7F) & 0xFF) result &= (Ports::base[7] & Ports::wii[7]);
-
-		result &= readKeyboard(port) & 0xBF;
-
-		
-
-		return result;
-	}
-  return 0xff;
+	
+  return res;
 }
 
 static void port_out(z80* const z, uint8_t port, uint8_t val) {
@@ -471,6 +327,11 @@ int spectrum_init(spectrum* const p, const char* rom_dir) {
   p->cpu.port_out = port_out;
 
   p->border_color   = 7;
+
+  for (int _i = 0 ; _i<8 ; _i++ )
+  {
+	  p->keyboard[_i] = 0xff;	
+  }
 
   memset(p->rom, 0, sizeof(p->rom));
   memset(p->ram, 0, sizeof(p->ram));

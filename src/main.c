@@ -100,7 +100,68 @@ static void mainloop(void) {
       } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
         has_focus = false;
       }
-    } else if (e.type == SDL_KEYDOWN) {
+    } else if ((e.type == SDL_KEYUP) || (e.type == SDL_KEYDOWN)) {
+		bool press = (e.type == SDL_KEYDOWN);
+		int row = -1, bit = -1;
+
+		switch (e.key.keysym.sym) {
+			// Teclas Menu
+			case SDLK_F2: 
+				if (press) { 
+					screenshot(p); 
+				}
+			break;
+
+			// Resto Teclas
+			case SDLK_a:     row=1; bit=0; break;
+			case SDLK_b:     row=7; bit=4; break;
+			case SDLK_c:     row=0; bit=3; break;
+			case SDLK_d:     row=1; bit=2; break;
+			case SDLK_e:     row=2; bit=2; break;
+			case SDLK_f:     row=1; bit=3; break;
+			case SDLK_g:     row=1; bit=4; break;
+			case SDLK_h:     row=6; bit=4; break;
+			case SDLK_i:     row=5; bit=2; break;
+			case SDLK_j:     row=6; bit=3; break;
+			case SDLK_k:     row=6; bit=2; break;
+			case SDLK_l:     row=6; bit=1; break;
+			case SDLK_m:     row=7; bit=2; break;
+			case SDLK_n:     row=7; bit=3; break;
+			case SDLK_o:     row=5; bit=1; break;
+			case SDLK_p:     row=5; bit=0; break;
+			case SDLK_q:     row=2; bit=0; break;
+			case SDLK_r:     row=2; bit=3; break;
+			case SDLK_s:     row=1; bit=1; break;
+			case SDLK_t:     row=2; bit=4; break;
+			case SDLK_u:     row=5; bit=3; break;
+			case SDLK_v:     row=0; bit=4; break;
+			case SDLK_w:     row=2; bit=1; break;
+			case SDLK_x:     row=0; bit=2; break;
+			case SDLK_y:     row=5; bit=4; break;
+			case SDLK_z:     row=0; bit=1; break;
+			case SDLK_0:     row=4; bit=0; break;
+			case SDLK_1:     row=3; bit=0; break;
+			case SDLK_2:     row=3; bit=1; break;
+			case SDLK_3:     row=3; bit=2; break;
+			case SDLK_4:     row=3; bit=3; break;
+			case SDLK_5:     row=3; bit=4; break;
+			case SDLK_6:     row=4; bit=4; break;
+			case SDLK_7:     row=4; bit=3; break;
+			case SDLK_8:     row=4; bit=2; break;
+			case SDLK_9:     row=4; bit=1; break;
+			case SDLK_SPACE: row=7; bit=0; break;
+			case SDLK_RETURN:row=6; bit=0; break;
+			case SDLK_LSHIFT:
+			case SDLK_RSHIFT: row=0; bit=0; break; // Caps Shift
+			case SDLK_LCTRL:
+			case SDLK_RCTRL:  row=7; bit=1; break; // Symbol Shift
+		}
+
+		if (row >= 0 && bit >= 0) {
+			if (press) p->keyboard[row] &= ~(1 << bit);
+			else       p->keyboard[row] |=  (1 << bit);
+		}
+	
       switch (e.key.keysym.scancode) {
       /*case SDL_SCANCODE_RETURN:
       case SDL_SCANCODE_1: p->p1_start = 1; break; // start (1p)
@@ -116,29 +177,9 @@ static void mainloop(void) {
 
       case SDL_SCANCODE_M: p->mute_audio = !p->mute_audio; break;
       case SDL_SCANCODE_P: is_paused = !is_paused; break;*/
-      case SDL_SCANCODE_S: screenshot(p); break;
+      
       /*case SDL_SCANCODE_I: pac_cheat_invincibility(p); break;
       case SDL_SCANCODE_TAB: speed = 5; break;*/
-      default: break;
-      }
-    } else if (e.type == SDL_KEYUP) {
-      switch (e.key.keysym.scancode) {
-      /*case SDL_SCANCODE_RETURN:
-      case SDL_SCANCODE_1: p->p1_start = 0; break; // start (1p)
-      case SDL_SCANCODE_2: p->p2_start = 0; break; // start (2p)
-      case SDL_SCANCODE_UP: p->p1_up = 0; break; // up
-      case SDL_SCANCODE_DOWN: p->p1_down = 0; break; // down
-      case SDL_SCANCODE_LEFT: p->p1_left = 0; break; // left
-      case SDL_SCANCODE_RIGHT: p->p1_right = 0; break; // right
-      case SDL_SCANCODE_C:
-      case SDL_SCANCODE_5: p->coin_s1 = 0; break; // coin
-      case SDL_SCANCODE_V: p->coin_s2 = 0; break; // coin (slot 2)
-      case SDL_SCANCODE_T: p->board_test = 0; break; // board test
-      case SDL_SCANCODE_TAB:
-        speed = 1;
-        // clear the queued audio to avoid audio delays
-        SDL_ClearQueuedAudio(audio_device);
-        break;*/
       default: break;
       }
     } 
