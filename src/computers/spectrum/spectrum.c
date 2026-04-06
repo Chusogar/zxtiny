@@ -26,6 +26,15 @@ uint32_t spectrum_palette[16] = {
 static double audio_sample_accumulator = 0.0;  // Acumula muestras fraccionarias
 static int cycles_since_last_audio_update = 0; // Ciclos desde la última actualización de audio
 
+// int current_speaker_level;
+// int16_t *audio_buffer; int audio_buffer_len, audio_frame_pos, sample_rate;
+// bool mute_audio, sound_enabled;
+
+// Declaración de funciones auxiliares de audio:
+void spectrum_audio_mix(struct spectrum* p, int cycles);
+void spectrum_audio_finalize(struct spectrum* p);
+
+
 // ═══════════════════════════════════════════════════════════════════
 // LECTURA Y ESCRITURA DE MEMORIA
 // ═══════════════════════════════════════════════════════════════════
@@ -142,17 +151,17 @@ static void port_out(z80* const z, uint16_t port, uint8_t val) {
     if ((port & 1) == 0) {
         p->border_color   = val & 0x07;
         p->last_fe_write  = val;
-
-        // El bit 4 controla el altavoz
-        uint8_t new_speaker_level = (val & 0x10) ? 1 : 0;
-        
-        p->current_speaker_level = new_speaker_level;
+        // BEEPER: detectar transición
+        uint8_t new_speaker_level = ((val & 0x10)!=0) ? 1 : 0;
+        if (new_speaker_level != p->current_speaker_level) 
+		{
+            spectrum_audio_mix(p, cycles_since_last_audio_update);
+			p->current_speaker_level = new_speaker_level;
+			cycles_since_last_audio_update = 0;
+        }
     }
-
-    // setting the interrupt vector
-    if (port == 0) {
+    if (port == 0)
         p->int_vector = val;
-    }
 }
 
 #endif // Z80_JGZ80
@@ -377,6 +386,42 @@ void spectrum_quit(spectrum* const p) {
     }
 }
 
+
+
+// ════════════════════════════════════════════════════════════════
+// MEZCLA DE SONIDO DEL BEEPER (para llamar desde port_out y fin de frame)
+// ════════════════════════════════════════════════════════════════
+void spectrum_audio_mix(spectrum* const p, int cycles) {
+    if (!p->sound_enabled || p->mute_audio || !p->audio_buffer) return;
+    // Calcula cuántas muestras de audio han transcurrido desde el último cambio.
+    int samples = (int)((double)cycles * p->sample_rate / 3500000);
+    //cycles_since_last_audio_update += 0;
+
+    for (int i = 0; i < samples && p->audio_frame_pos < p->audio_buffer_len; ++i) {
+		int16_t val = (p->current_speaker_level !=0) ? 8000 : -8000; // Ajusta el volumen aquí si lo deseas
+        p->audio_buffer[p->audio_frame_pos++] = val;
+    }
+	//if (p->push_sample) p->push_sample(p, p->audio_frame_pos);
+	//p->audio_frame_pos = 0; // Reinicia el índice para el siguiente frame
+}
+
+// Al terminar cada frame, rellena con el valor estable las muestras que falten
+void spectrum_audio_finalize(spectrum* const p) {
+	int samples = (int)((double)cycles_since_last_audio_update * p->sample_rate / 3500000);
+	
+	//while (p->audio_frame_pos < p->audio_buffer_len) {
+	/*for (int i = 0; i < samples && p->audio_frame_pos < p->audio_buffer_len; ++i) {
+	    int16_t val = (p->current_speaker_level!=0) ? 8000 : 0;
+        p->audio_buffer[p->audio_frame_pos++] = val;
+    }*/
+    // Aquí normalmente enviarías el buffer al sistema de audio (SDL, etc)
+    // Ejemplo: if (p->push_sample) p->push_sample(p->audio_buffer, p->audio_buffer_len);
+	//p->audio_buffer_len = audio_frame_pos;
+	if (p->push_sample) p->push_sample(p, p->audio_frame_pos);
+    p->audio_frame_pos = 0; // Reinicia el índice para el siguiente frame
+	//cycles_since_last_audio_update = 0;
+}
+
 // Variable global para conteo de ciclos (Z80_JGZ80)
 int cpu_cyc = 0;
 
@@ -405,8 +450,14 @@ void spectrum_update(spectrum* const p, unsigned int ms) {
         count += elapsed;
         cycles_since_last_audio_update += elapsed;
 
+		//spectrum_audio_mix(p, _cyc_done);
+
         if (cpu_cyc >= SPECTRUM_CYCLES_PER_FRAME) {
             cpu_cyc -= SPECTRUM_CYCLES_PER_FRAME;
+
+			// Finaliza audio para este frame
+            spectrum_audio_finalize(p);
+            cycles_since_last_audio_update = 0;
 
             if (p->vblank_enabled) {
                 z80_pulse_irq(&p->cpu, 1);

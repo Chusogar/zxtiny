@@ -45,6 +45,8 @@ static void update_screen(spectrum* const p) {
 static void push_sample(spectrum* const p, int16_t sample) {
   //SDL_QueueAudio(audio_device, &sample, sizeof(int16_t) * 1);
   //SDL_QueueAudio(audio_device, &p->audio_buffer, sizeof(int16_t) * 735);
+  SDL_QueueAudio(audio_device, &p->audio_buffer, sample * (int)sizeof(int16_t));
+  memset (p->audio_buffer,p->current_speaker_level,p->audio_buffer_len);
 }
 
 static void send_quit_event() {
