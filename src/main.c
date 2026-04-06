@@ -43,7 +43,8 @@ static void update_screen(spectrum* const p) {
 }
 
 static void push_sample(spectrum* const p, int16_t sample) {
-  SDL_QueueAudio(audio_device, &sample, sizeof(int16_t) * 1);
+  //SDL_QueueAudio(audio_device, &sample, sizeof(int16_t) * 1);
+  //SDL_QueueAudio(audio_device, &p->audio_buffer, sizeof(int16_t) * 735);
 }
 
 static void send_quit_event() {
@@ -196,7 +197,7 @@ int main(int argc, char** argv) {
     SDL_Log("Unable to create texture: %s", SDL_GetError());
     return 1;
   }
-
+/*
   // audio init
   SDL_AudioSpec audio_spec;
   SDL_zero(audio_spec);
@@ -207,7 +208,15 @@ int main(int argc, char** argv) {
   audio_spec.callback = NULL;
 
   audio_device = SDL_OpenAudioDevice(NULL, 0, &audio_spec, NULL, 0);
-
+*/
+SDL_AudioSpec want = {0}, have = {0};
+    want.freq     = 44100;
+    want.format   = AUDIO_S16SYS;
+    want.channels = 1;
+    want.samples  = 256;
+    want.callback = NULL; // Uso de SDL_QueueAudio
+	//want.callback = audio_callback;
+    audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FORMAT_CHANGE);
   if (audio_device == 0) {
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "failed to open audio: %s",
         SDL_GetError());
@@ -215,6 +224,8 @@ int main(int argc, char** argv) {
     const char* driver_name = SDL_GetCurrentAudioDriver();
     SDL_Log("audio device has been opened (%s)", driver_name);
   }
+
+  printf("Frecuencia obtenida: %d\n",have.freq);
 
   SDL_PauseAudioDevice(audio_device, 0); // start playing
 
@@ -251,7 +262,7 @@ int main(int argc, char** argv) {
         "Please copy rom files next to spectrum executable.", window);
     return 1;
   }
-  p->sample_rate = audio_spec.freq;
+  p->sample_rate = want.freq;
   p->push_sample = push_sample;
   p->update_screen = update_screen;
   update_screen(p);
