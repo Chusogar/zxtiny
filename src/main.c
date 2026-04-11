@@ -42,11 +42,19 @@ static void update_screen(spectrum* const p) {
   SDL_UnlockTexture(texture);
 }
 
-static void push_sample(spectrum* const p, int16_t sample) {
-  //SDL_QueueAudio(audio_device, &sample, sizeof(int16_t) * 1);
-  //SDL_QueueAudio(audio_device, &p->audio_buffer, sizeof(int16_t) * 735);
-  SDL_QueueAudio(audio_device, &p->audio_buffer, sample * (int)sizeof(int16_t));
-  memset (p->audio_buffer,p->current_speaker_level,p->audio_buffer_len);
+static void push_sample(spectrum* const p, int num_samples) {
+	if (num_samples > 0)
+	{
+		SDL_QueueAudio(audio_device, p->audio_buffer, (uint32_t)(num_samples * (int)sizeof(int16_t)));
+	}
+
+	int16_t fill_val = (p->current_speaker_level != 0) ? 8000 : -8000;
+
+	for ( int _i = 0; _i < p->audio_buffer_len ; _i++ )
+	{
+		p->audio_buffer[_i] = fill_val;
+	}
+  
 }
 
 static void send_quit_event() {

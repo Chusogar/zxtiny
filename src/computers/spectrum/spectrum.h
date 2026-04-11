@@ -21,16 +21,18 @@
 //#include "wsg.h"
 
 #define SPECTRUM_CLOCK_SPEED 3500000 // 3.072 MHz (= number of cycles per second)
-#define SPECTRUM_FPS 60
+#define SPECTRUM_FPS 50
 #define SPECTRUM_CYCLES_PER_FRAME (SPECTRUM_CLOCK_SPEED / SPECTRUM_FPS)
 #define SPECTRUM_SCREEN_WIDTH	256
 #define SPECTRUM_SCREEN_HEIGHT	192
 
 // Audio
+#define SOUND_HIGH	8000
+#define SOUND_LOW	-8000
 #define SPECTRUM_SAMPLE_RATE 44100
 #define SPECTRUM_SAMPLES_PER_TSTATE (SPECTRUM_SAMPLE_RATE / SPECTRUM_CLOCK_SPEED)
 #define SPECTRUM_LENGHT_AUDIO_FRAME (SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS)
-
+#define TSTATES_PER_SAMPLE (SPECTRUM_CLOCK_SPEED / SPECTRUM_SAMPLE_RATE)
 
 
 /*struct z80_cpu {
@@ -53,6 +55,7 @@ struct spectrum {
   uint8_t border_color;
   uint8_t last_fe_write;
   uint8_t current_speaker_level;
+  uint8_t current_mic_level;
 
   uint8_t keyboard[8];
 
@@ -96,7 +99,7 @@ struct spectrum {
   int16_t* audio_buffer;
   int sample_rate;
   bool mute_audio;
-  void (*push_sample)(spectrum* const n, int16_t);
+  void (*push_sample)(struct spectrum* p, int num_samples);
   int audio_frame_pos;
 };
 

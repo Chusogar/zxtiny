@@ -29,10 +29,87 @@ static int cycles_since_last_audio_update = 0; // Ciclos desde la última actual
 // int current_speaker_level;
 // int16_t *audio_buffer; int audio_buffer_len, audio_frame_pos, sample_rate;
 // bool mute_audio, sound_enabled;
+static double  audio_next_sample_t = 0.0;
+
 
 // Declaración de funciones auxiliares de audio:
 void spectrum_audio_mix(struct spectrum* p, int cycles);
 void spectrum_audio_finalize(struct spectrum* p);
+
+// ═══════════════════════════════════════════════════════════════════
+// SINCRONIZACIÓN TSTATES
+// ═══════════════════════════════════════════════════════════════════
+uint32_t tstates;
+const double FILTER_ALPHA = 0.5;
+    
+static int16_t beeper_sample_now(void* userdata) {
+	spectrum* const p = (spectrum*) userdata;
+    return p->current_speaker_level ? 8000 : -8000;
+}
+
+void audio_push_sample(void* userdata, int16_t s) {
+	//printf("0\n");
+
+
+	spectrum* const p = (spectrum*) userdata;
+//printf("1\n");
+
+	
+#if 1	
+	//if (p->audio_buffer_len < (SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS))
+	{
+		p->audio_buffer[p->audio_buffer_len++] = s;
+	}
+	
+    //printf("2\n");
+
+    if (p->audio_buffer_len >= (SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS)) {
+        //SDL_QueueAudio(audio_dev, p->audio_buffer, (Uint32)(p->audio_buffer_len*sizeof(int16_t)));
+		if (p->push_sample) p->push_sample(p, (SPECTRUM_SAMPLE_RATE / SPECTRUM_FPS));
+        p->audio_buffer_len = 0;
+    }
+	//printf("3\n");
+
+#endif
+}
+
+void audio_flush_queue(spectrum* const p) {
+#if 1
+	//spectrum* const p = (spectrum*) userdata;
+    if (p->audio_buffer_len) 
+	{
+        //SDL_QueueAudio(audio_dev, p->audio_buffer, (Uint32)(p->audio_buffer_len*sizeof(int16_t)));
+		if (p->push_sample) p->push_sample(p, p->audio_buffer_len);
+        p->audio_buffer_len = 0;
+    }
+#endif
+}
+
+void addTstates(spectrum* const p, uint32_t delta)
+{
+	
+    if (delta == 0) return;
+    const double end_t = (double)tstates + (double)delta;
+    while ((double)tstates < end_t) {
+        double until_sample = audio_next_sample_t - (double)tstates;
+        if (until_sample <= 0.0) {
+            int32_t mixed = (int32_t)beeper_sample_now(&p); // + (int32_t)tape_sample_now();
+            if (mixed > INT16_MAX) mixed = INT16_MAX;
+            if (mixed < INT16_MIN) mixed = INT16_MIN;
+            audio_push_sample(p, (int16_t)mixed);
+            audio_next_sample_t += TSTATES_PER_SAMPLE;
+            continue;
+        }
+        uint32_t step = (uint32_t)((double)until_sample);
+        double left = end_t - (double)tstates;
+        if (step == 0) step = 1;
+        if ((double)step > left) step = (uint32_t)left;
+#if 0
+        tape_advance(step);
+#endif
+        tstates += step;
+    }
+}
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -42,6 +119,8 @@ void spectrum_audio_finalize(struct spectrum* p);
 static uint8_t rb(void* userdata, uint16_t addr) {
   spectrum* const p = (spectrum*) userdata;
   addr &= 0xffff;
+
+  //addTstates(p, 3);
 
   if (addr < 0x4000) {
     return p->rom[addr];
@@ -54,6 +133,8 @@ static uint8_t rb(void* userdata, uint16_t addr) {
 static void wb(void* userdata, uint16_t addr, uint8_t val) {
   spectrum* const p = (spectrum*) userdata;
   addr &= 0xffff;
+
+  //addTstates(p, 3);
 
   if (addr < 0x4000) {
     // cannot write to rom
@@ -142,6 +223,8 @@ static uint8_t port_in(z80* const z, uint16_t port) {
                 res &= p->keyboard[r];
     }
 
+	//addTstates(p, 3);
+
     return res;
 }
 
@@ -149,19 +232,44 @@ static void port_out(z80* const z, uint16_t port, uint8_t val) {
     spectrum* const p = (spectrum*) z->userdata;
 
     if ((port & 1) == 0) {
+#if 1
         p->border_color   = val & 0x07;
         p->last_fe_write  = val;
         // BEEPER: detectar transición
-        uint8_t new_speaker_level = ((val & 0x10)!=0) ? 1 : 0;
+		uint8_t _mic = ((val & 0x08)!=0) ? 1 : 0;
+
+		if (_mic != p->current_mic_level) 
+		{
+			p->current_mic_level = _mic;
+		}
+
+		uint8_t new_speaker_level = (((val & 0x10)!=0) ? 1 : 0); //| _mic;
+		
         if (new_speaker_level != p->current_speaker_level) 
 		{
-            spectrum_audio_mix(p, cycles_since_last_audio_update);
+			spectrum_audio_mix(p, cycles_since_last_audio_update);
 			p->current_speaker_level = new_speaker_level;
 			cycles_since_last_audio_update = 0;
         }
+#endif
+#if 0
+		uint8_t new_speaker_level = (((val & 0x10)!=0) ? 1 : 0);
+		
+        if (new_speaker_level != p->current_speaker_level) 
+		{
+            p->current_speaker_level = new_speaker_level;
+			cycles_since_last_audio_update = 0;
+        }
+        //lastTstate = tstates;
+        p->border_color = val & 0x07;
+        // Ignoramos bit 3 (MIC) como control de motor para no parar la cinta
+        p->last_fe_write = val;
+#endif
     }
     if (port == 0)
         p->int_vector = val;
+
+	//addTstates(p, 4);
 }
 
 #endif // Z80_JGZ80
@@ -394,11 +502,11 @@ void spectrum_quit(spectrum* const p) {
 void spectrum_audio_mix(spectrum* const p, int cycles) {
     if (!p->sound_enabled || p->mute_audio || !p->audio_buffer) return;
     // Calcula cuántas muestras de audio han transcurrido desde el último cambio.
-    int samples = (int)((double)cycles * p->sample_rate / 3500000);
-    //cycles_since_last_audio_update += 0;
+    int samples = (int)((double)cycles * p->sample_rate / SPECTRUM_CLOCK_SPEED);
+    cycles_since_last_audio_update += cycles;
 
     for (int i = 0; i < samples && p->audio_frame_pos < p->audio_buffer_len; ++i) {
-		int16_t val = (p->current_speaker_level !=0) ? 8000 : -8000; // Ajusta el volumen aquí si lo deseas
+		int16_t val = (p->current_speaker_level !=0) ? SOUND_HIGH : SOUND_LOW; // Ajusta el volumen aquí si lo deseas
         p->audio_buffer[p->audio_frame_pos++] = val;
     }
 	//if (p->push_sample) p->push_sample(p, p->audio_frame_pos);
@@ -406,21 +514,22 @@ void spectrum_audio_mix(spectrum* const p, int cycles) {
 }
 
 // Al terminar cada frame, rellena con el valor estable las muestras que falten
-void spectrum_audio_finalize(spectrum* const p) {
-	int samples = (int)((double)cycles_since_last_audio_update * p->sample_rate / 3500000);
-	
-	//while (p->audio_frame_pos < p->audio_buffer_len) {
-	/*for (int i = 0; i < samples && p->audio_frame_pos < p->audio_buffer_len; ++i) {
-	    int16_t val = (p->current_speaker_level!=0) ? 8000 : 0;
-        p->audio_buffer[p->audio_frame_pos++] = val;
-    }*/
-    // Aquí normalmente enviarías el buffer al sistema de audio (SDL, etc)
-    // Ejemplo: if (p->push_sample) p->push_sample(p->audio_buffer, p->audio_buffer_len);
-	//p->audio_buffer_len = audio_frame_pos;
-	if (p->push_sample) p->push_sample(p, p->audio_frame_pos);
-    p->audio_frame_pos = 0; // Reinicia el índice para el siguiente frame
-	//cycles_since_last_audio_update = 0;
+void spectrum_audio_finalize(struct spectrum* p) {
+    // Rellenar muestras restantes con el nivel actual del beeper
+    int16_t fill_val = (p->current_speaker_level != 0) ? 8000 : -8000;
+    while (p->audio_frame_pos < p->audio_buffer_len) {
+        p->audio_buffer[p->audio_frame_pos++] = fill_val;
+    }
+
+    // Enviar buffer completo a SDL
+    if (p->push_sample) {
+        p->push_sample(p, p->audio_buffer_len);
+    }
+
+    // Resetear para el siguiente frame
+    p->audio_frame_pos = 0;
 }
+
 
 // Variable global para conteo de ciclos (Z80_JGZ80)
 int cpu_cyc = 0;
@@ -438,25 +547,32 @@ int cpu_cyc = 0;
 */
 void spectrum_update(spectrum* const p, unsigned int ms) {
     int count = 0;
+	
+
+	// Re-sincroniza el cursor de audio con el inicio del frame
+	tstates = 0;
+	audio_next_sample_t = (double)tstates;
     
     while (count < ms * SPECTRUM_CLOCK_SPEED / 1000) {
 
 
 #ifdef Z80_JGZ80
         int cyc = cpu_cyc;
-        int _cyc_done = z80_step(&p->cpu);
+        int _cyc_done = z80_step_n(&p->cpu, 1);
+		//addTstates(p, 1);
         cpu_cyc += _cyc_done;
         int elapsed = cpu_cyc - cyc;
         count += elapsed;
         cycles_since_last_audio_update += elapsed;
 
-		//spectrum_audio_mix(p, _cyc_done);
+		spectrum_audio_mix(p, _cyc_done);
 
         if (cpu_cyc >= SPECTRUM_CYCLES_PER_FRAME) {
             cpu_cyc -= SPECTRUM_CYCLES_PER_FRAME;
 
 			// Finaliza audio para este frame
             spectrum_audio_finalize(p);
+			//audio_flush_queue(p);
             cycles_since_last_audio_update = 0;
 
             if (p->vblank_enabled) {
