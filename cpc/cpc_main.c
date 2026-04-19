@@ -68,7 +68,7 @@ static void cpc_key(SDL_Keycode sym, bool press) {
         // Fila 1: CURSOR-LEFT, COPY, F7, F8, F5, F1, F2, F0
         case SDLK_LEFT:   row=1;bit=0;break;
         // Fila 2: CAPS-LK, A, TAB, Q, Z, W, S, X (letras fila izq)
-        case SDLK_a:      row=2;bit=1;break;
+        case SDLK_a:      row=8;bit=5;break;
         case SDLK_q:      row=2;bit=3;break;
         case SDLK_z:      row=2;bit=4;break;
         case SDLK_w:      row=2;bit=5;break;
@@ -83,11 +83,11 @@ static void cpc_key(SDL_Keycode sym, bool press) {
         case SDLK_r:      row=4;bit=2;break;
         case SDLK_f:      row=4;bit=3;break;
         case SDLK_v:      row=4;bit=4;break;
-        case SDLK_c:      row=4;bit=5;break;
+        case SDLK_c:      row=7;bit=6;break;
         // Fila 5: 5, 6, T, G, B
         case SDLK_5:      row=5;bit=0;break;
         case SDLK_6:      row=5;bit=1;break;
-        case SDLK_t:      row=5;bit=2;break;
+        case SDLK_t:      row=6;bit=3;break;
         case SDLK_g:      row=5;bit=3;break;
         case SDLK_b:      row=5;bit=4;break;
         // Fila 6: SPACE, 7, Y, H, N
@@ -109,7 +109,7 @@ static void cpc_key(SDL_Keycode sym, bool press) {
         case SDLK_0:      row=8;bit=0;break;
         case SDLK_p:      row=8;bit=3;break;
         // Fila 9: DEL, ^, -, ], RETURN, \, L, '
-        case SDLK_RETURN: row=9;bit=4;break;
+        case SDLK_RETURN: row=2;bit=2;break;
         case SDLK_l:      row=9;bit=5;break;
         // Shifts
         case SDLK_LSHIFT:
@@ -122,7 +122,7 @@ static void cpc_key(SDL_Keycode sym, bool press) {
     }
     if (row>=0 && bit>=0) {
         if (press) cpc_keymap[row] &= ~(1<<bit);
-        else       cpc_keymap[row] |=  (1<<bit);
+		else       cpc_keymap[row] |=  (1<<bit);
     }
 }
 

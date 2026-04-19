@@ -10,10 +10,18 @@
  *  · Registro de control: ROM lo/hi, modo vídeo, reset IRQ
  *  · Banking RAM CPC 6128: decodificación completa de los 8 modos (bits 2:0)
  *    con las 4 configuraciones de página documentadas
- *  · IRQ: contador de 52 líneas HSYNCs exacto; reset con bit4 del reg de control
+ *  · IRQ: contador de 52 HSYNCs exacto; reset con bit4 y con VSYNC del CRTC
+ *  · Reset IRQ por VSYNC: el flanco de subida de VSYNC fuerza el contador a
+ *    0 (o a 32 si el contador estaba entre 32 y 51), sincronizando el timing
+ *    de interrupciones con el frame exactamente como en hardware real
  *  · Decodificación de puertos: A15=0 && A14=1 → Gate Array (0x7Fxx)
- *  · VSYNC capturado para bit 0 del puerto B de la PPI
+ *  · VSYNC capturado para bit 0 del puerto B de la PPI; generado línea a línea
  *  · Interleave de líneas de vídeo CRTC: fórmula exacta del CPC real
+ *  · Cambios de modo vídeo mid-line: el GA registra el modo activo en cada
+ *    línea de escán durante la ejecución de la CPU; render_frame() usa esa
+ *    tabla para decodificar cada línea con su modo correcto
+ *  · AY-3-8912 estéreo ABC: canal A→izda, canal B→ambos, canal C→dcha,
+ *    salida de 2 canales intercalados (L,R) a SDL en formato stereo
  */
 
 #include "cpc.h"
@@ -43,6 +51,9 @@ static uint8_t mem_config  = 0x00;
 static bool    rom_lo_en   = true;
 static bool    rom_hi_en   = true;
 
+
+// ROM superior seleccionada (puerto &DFxx). En CPC6128: 0=BASIC, 7=AMSDOS
+static uint8_t selected_upper_rom = 0;
 /*
  * CPC 6128: el puerto 0x7Fxx con bits 7:6 = 11 selecciona la RAM.
  * Los bits 2:0 codifican 8 configuraciones de mapa de memoria:
@@ -116,9 +127,29 @@ static uint8_t ga_ink[17];             // índice hw (0-26) para cada lápiz/bor
 static uint8_t ga_mode          = 1;
 static uint8_t ga_irq_counter   = 0;   // cuenta HSYNCs; IRQ al llegar a 52
 static bool    ga_irq_pending   = false;
-static bool    ga_vsync         = false; // estado VSYNC (para PPI puerto B bit0)
+static bool    ga_vsync         = false; // VSYNC activo (PPI puerto B bit7)
+static uint8_t ga_vsync_counter = 0;    // duración VSYNC en líneas (R3[7:4])
+static uint32_t ga_hsync_line   = 0;    // línea de escán actual dentro del frame
 
 int cpc_video_mode = 1;
+
+/*
+ * ── Tabla de modo vídeo por línea de escán (mid-line mode changes) ────────────
+ *
+ * El Gate Array permite cambiar el modo vídeo escribiendo en el puerto 0x7Fxx
+ * en cualquier momento, incluso a mitad de una línea. En hardware, el cambio
+ * es efectivo desde el siguiente byte que el GA lee de la VRAM.
+ *
+ * Para emularlo correctamente sin renderizar en tiempo de CPU (lo que
+ * requeriría sincronizar píxel a píxel), usamos una tabla que registra
+ * el último modo activo al inicio de cada línea de escán. Esto captura
+ * todos los cambios que ocurren entre el HSYNC de una línea y el siguiente,
+ * cubriendo el caso más común (cambios entre líneas en la ISR).
+ *
+ * Resolución máxima: 312 líneas totales PAL (incluyendo blanking).
+ */
+#define GA_SCAN_LINES 312
+static uint8_t ga_mode_per_line[GA_SCAN_LINES];  // modo activo en cada línea
 
 /*
  * Paleta hardware EXACTA del Gate Array del CPC.
@@ -196,7 +227,6 @@ static const uint32_t cpc_hw_palette[32] = {
     0xFF006B00, // 30 Verde oscuro (repetido)
     0xFFFF6B00  // 31 Naranja (repetido)
 };
-
 
 // ── AY-3-8912 ─────────────────────────────────────────────────────────────────
 static uint8_t ay_reg[16];
@@ -313,16 +343,35 @@ static uint8_t ppi_ctrl  = 0x82;
 
 uint8_t cpc_keymap[10];   // 10 filas; bit=0 → tecla pulsada
 
-// ── Audio buffer ──────────────────────────────────────────────────────────────
-static int16_t audio_buf[512];
-static size_t  audio_buf_len = 0;
+// ── AY-3-8912 – Salida estéreo ABC ───────────────────────────────────────────
+/*
+ * El CPC conecta los canales del AY-3-8912 al amplificador de audio en
+ * configuración ABC estéreo:
+ *
+ *   Canal A → salida izquierda  (Left)
+ *   Canal B → salida izquierda + derecha (Center, aparece en ambos canales)
+ *   Canal C → salida derecha    (Right)
+ *
+ * Para evitar que el canal B suene al doble de fuerte que A y C cuando los
+ * tres están activos, se aplica la mezcla estándar con los pesos documentados:
+ *
+ *   L = A + B*0.5
+ *   R = C + B*0.5
+ *
+ * SDL espera muestras intercaladas: L0, R0, L1, R1, …
+ * El buffer de audio pasa de int16_t[N] a int16_t[N*2].
+ */
+static int16_t audio_buf[1024];   // pares (L,R) intercalados; 512 frames estéreo
+static size_t  audio_buf_len = 0; // número de int16_t (no frames)
 static double  audio_next_t  = 0.0;
 static const double CPC_CYC_PER_SAMPLE =
     (double)CPC_CLOCK_HZ / (double)CPC_AUDIO_RATE;
 
-static void audio_push(int16_t s) {
-    audio_buf[audio_buf_len++] = s;
-    if (audio_buf_len == sizeof(audio_buf)/sizeof(audio_buf[0])) {
+/* Genera un par de muestras (L, R) y las añade al buffer. */
+static void audio_push_stereo(int16_t L, int16_t R) {
+    audio_buf[audio_buf_len++] = L;
+    audio_buf[audio_buf_len++] = R;
+    if (audio_buf_len >= sizeof(audio_buf)/sizeof(audio_buf[0])) {
         SDL_QueueAudio(cpc_audio_dev, audio_buf,
                        (Uint32)(audio_buf_len * sizeof(int16_t)));
         audio_buf_len = 0;
@@ -336,12 +385,85 @@ static void audio_flush(void) {
     }
 }
 
+/*
+ * Genera una muestra estéreo del AY-3-8912.
+ * Devuelve el par (L, R) por parámetros de salida.
+ */
+static void ay_sample_stereo(int16_t* out_L, int16_t* out_R) {
+    // ── Generador de ruido ────────────────────────────────────────────────────
+    if (++ay_noise_counter >= ay_noise_period * 8) {
+        ay_noise_counter = 0;
+        // LFSR de 17 bits con XOR en bits 0 y 3 (polinomio del AY real)
+        if ((ay_noise_lfsr & 1) ^ ((ay_noise_lfsr >> 3) & 1))
+            ay_noise_lfsr = (ay_noise_lfsr >> 1) | 0x10000;
+        else
+            ay_noise_lfsr >>= 1;
+        ay_noise_out = ay_noise_lfsr & 1;
+    }
+
+    // ── Generador de envolvente ───────────────────────────────────────────────
+    if (++ay_env_counter >= ay_env_period * 8) {
+        ay_env_counter = 0;
+        if (!ay_env_hold) {
+            if (ay_env_att) {
+                if (ay_env_vol < 15) ay_env_vol++;
+                else {
+                    if (!ay_env_cont) ay_env_hold = true;
+                    if (ay_env_alt)   ay_env_att  = !ay_env_att;
+                }
+            } else {
+                if (ay_env_vol > 0) ay_env_vol--;
+                else {
+                    if (!ay_env_cont) ay_env_hold = true;
+                    if (ay_env_alt)   ay_env_att  = !ay_env_att;
+                }
+            }
+        }
+    }
+
+    // ── Generadores de tono y mezcla estéreo ABC ──────────────────────────────
+    int32_t ch_vol[3];
+    for (int c = 0; c < 3; c++) {
+        if (++ay_ch[c].counter >= ay_ch[c].period * 8) {
+            ay_ch[c].counter = 0;
+            ay_ch[c].phase   = 1.0 - ay_ch[c].phase;
+        }
+        int tone_out = (ay_ch[c].phase >= 0.5) ? 1 : 0;
+        int gate     = (ay_ch[c].tone_en  ? tone_out     : 1)
+                     & (ay_ch[c].noise_en ? ay_noise_out : 1);
+        ch_vol[c] = gate ? (int32_t)(ay_ch[c].env_en
+                           ? AY_VOL_TABLE[ay_env_vol]
+                           : AY_VOL_TABLE[ay_ch[c].vol]) : 0;
+    }
+
+    /*
+     * Mezcla ABC estéreo:
+     *   L = chA + chB/2
+     *   R = chC + chB/2
+     *
+     * Se divide entre 2 (no entre 3) porque cada canal contribuye
+     * como máximo a la mitad del volumen total de un solo lado.
+     */
+    int32_t L = ch_vol[0] + ch_vol[1] / 2;
+    int32_t R = ch_vol[2] + ch_vol[1] / 2;
+
+    if (L >  INT16_MAX) L =  INT16_MAX;
+    if (L <  INT16_MIN) L =  INT16_MIN;
+    if (R >  INT16_MAX) R =  INT16_MAX;
+    if (R <  INT16_MIN) R =  INT16_MIN;
+
+    *out_L = (int16_t)L;
+    *out_R = (int16_t)R;
+}
+
 static void addCycles(uint32_t delta) {
     if (!delta) return;
     double end_t = (double)cpu_cycles + delta;
     while ((double)cpu_cycles < end_t) {
         if (audio_next_t <= (double)cpu_cycles) {
-            audio_push(ay_sample());
+            int16_t L, R;
+            ay_sample_stereo(&L, &R);
+            audio_push_stereo(L, R);
             audio_next_t += CPC_CYC_PER_SAMPLE;
         }
         double gap  = audio_next_t - (double)cpu_cycles;
@@ -367,12 +489,14 @@ static uint8_t mem_read_cb(void* ud, uint16_t addr) {
     int page = addr >> 14;          // 0-3
     uint8_t bank = ram_map[ram_cfg][page];
     if (page == 0 && rom_lo_en) return rom_os[addr];
-    if (page == 3 && rom_hi_en) {
-        // Banco 7 en el CPC 6128 puede cargar AMSDOS en lugar de BASIC
-        // cuando se selecciona mediante la expansión de ROM.
-        // Por defecto: BASIC ROM.
-        return rom_basic[addr - 0xC000];
+    
+if (page == 3 && rom_hi_en) {
+    // CPC6128: ROM 0 = BASIC, ROM 7 = AMSDOS (interna)
+    if ((selected_upper_rom & 0x7F) == 7) {
+        return rom_amsdos[addr - 0xC000];
     }
+    return rom_basic[addr - 0xC000];
+}
     return ram[bank][addr & 0x3FFF];
 }
 
@@ -385,143 +509,145 @@ static void mem_write_cb(void* ud, uint16_t addr, uint8_t val) {
 }
 
 // ── Bus de I/O ────────────────────────────────────────────────────────────────
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Decodificación de puertos / PSG teclado (CPC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Gate Array: seleccionado cuando A15=0 y A14=1 → &7Fxx (y espejos)
+static inline bool sel_gate_array(uint16_t port) { return (port & 0xC000) == 0x4000; }
+
+// CRTC: seleccionado cuando A14=0; subpuerto por A9:A8 → &BC/&BD/&BE/&BF
+static inline bool sel_crtc(uint16_t port) { return (port & 0x4000) == 0x0000; }
+static inline uint8_t crtc_sub(uint16_t port) { return (uint8_t)((port >> 8) & 0x03); }
+
+// PPI 8255: seleccionado cuando A11=0; subpuerto por A9:A8 → &F4/&F5/&F6/&F7
+static inline bool sel_ppi(uint16_t port) { return (port & 0x0800) == 0x0000; }
+static inline uint8_t ppi_sub(uint16_t port) { return (uint8_t)((port >> 8) & 0x03); }
+
+// FDC 765 en CPC6128: motor &FA7E, status &FB7E, data &FB7F
+static inline bool is_fdc_motor(uint16_t port) { return ((port & 0xFF00) == 0xFA00) && ((port & 0x00FF) == 0x7E); }
+static inline bool is_fdc_stat(uint16_t port)  { return ((port & 0xFF00) == 0xFB00) && ((port & 0x00FF) == 0x7E); }
+static inline bool is_fdc_data(uint16_t port)  { return ((port & 0xFF00) == 0xFB00) && ((port & 0x00FF) == 0x7F); }
+
+// PSG read: registro 14 (0x0E) devuelve la línea de teclado seleccionada por PPI Port C bits 3..0
+static inline uint8_t psg_read_reg_cpc(uint8_t reg) {
+    reg &= 0x0F;
+    if (reg == 0x0E) {
+        uint8_t row = ppi_portC & 0x0F;
+        if (row < 10) return cpc_keymap[row];
+        return 0xFF;
+    }
+    return ay_reg[reg];
+}
+
+// Aplicar modo del PSG (BDIR/BC1) tras cambios de Port C
+// 00 inactive, 01 read, 10 write, 11 select register
+static inline void ppi_apply_psg_control(void) {
+    uint8_t mode = (ppi_portC >> 6) & 0x03;
+    if (mode == 3) {
+        ay_sel = ppi_portA & 0x0F;
+    } else if (mode == 2) {
+        ay_write(ay_sel, ppi_portA);
+    }
+}
+
 static uint8_t io_read_cb(z80* z, uint16_t port) {
+    (void)z;
     addCycles(4);
-    uint8_t hi = port >> 8;
-    uint8_t lo = port & 0xFF;
 
-    // CRTC 6845: A14=0, A9=1 → puerto 0xBCxx / 0xBDxx
-    // Selección:  A14=0,A9=1,A8=0 → 0xBCxx  (write-only: seleccionar registro)
-    // Lectura:    A14=0,A9=1,A8=1 → 0xBDxx  (status / data)
-    if (!(hi & 0x40) && (hi & 0x80)) {
-        // A8 (lo bit 0 real es bit 8 del puerto de 16 bits → hi bit 0)
-        if (hi & 0x01) {
-            // 0xBD: lectura de registro CRTC
-            // Solo R16 (latch cursor) y R17 son legibles en el CRTC original;
-            // devolvemos el valor almacenado (aproximación suficiente).
-            return (crtc_sel < 18) ? crtc_reg[crtc_sel] : 0xFF;
-        }
-        return 0xFF;  // 0xBC es write-only
-    }
+    // ── FDC 765
+    if (is_fdc_stat(port)) return fdc_read_status(&fdc);
+    if (is_fdc_data(port)) return fdc_read_data(&fdc);
 
-    // FDC NEC µPD765A
-    if (hi == 0xFB) {
-        if (lo == 0x7E) return 0xFF;              // motor (write-only)
-        if (lo == 0x7F) return fdc_read_status(&fdc);
-        if (lo == 0xFF) return fdc_read_data(&fdc);
-    }
-    if ((hi & 0xFE) == 0xFA) return 0xFF;         // 0xFA7E / 0xFB7E
-
-    // PPI 8255: A11=0 → 0xF4xx-0xF7xx
-    // Dirección física: bits A1:A0 seleccionan puerto A/B/C/ctrl
-    if (!(hi & 0x08) && (hi & 0xF0) == 0xF0) {
-        switch (lo & 0x03) {
-            case 0: {
-                // Puerto A: AY data-bus
-                uint8_t ay_ctrl = (ppi_portC >> 6) & 3;
-                if (ay_ctrl == 1) return ay_reg[ay_sel & 0x0F];
+    // ── PPI 8255
+    if (sel_ppi(port)) {
+        switch (ppi_sub(port)) {
+            case 0: { // Port A
+                // bit4 del control = 1 → Port A input
+                bool inA = (ppi_ctrl & 0x10) != 0;
+                uint8_t psg_mode = (ppi_portC >> 6) & 0x03;
+                if (inA) {
+                    // Si PSG está en modo READ (01), Port A refleja el registro seleccionado
+                    if (psg_mode == 1) return psg_read_reg_cpc(ay_sel);
+                    return 0xFF; // alta impedancia
+                }
                 return ppi_portA;
             }
-            case 1: {
-                // Puerto B:
-                //  bit 7 = ~VSYNC (activo a nivel bajo en el pin del GA)
-                //  bit 6 = LK1 (cassette / expansion)
-                //  bit 5 = ~EXP (expansión presente)
-                //  bit 4 = LK4 (tipo de monitor)
-                //  bit 3 = LK3
-                //  bit 2 = LK2
-                //  bit 1 = printer busy
-                //  bit 0 = VSYNC (copia del estado GA)
-                uint8_t row = (ppi_portC & 0x0F) < 10 ?
-                              cpc_keymap[ppi_portC & 0x0F] : 0xFF;
-                // bit7: VSYNC activo bajo (cuando el GA genera VSYNC, este
-                // bit pasa a 0). Los demás bits de estado hardware son 1.
-                uint8_t vsync_bit = ga_vsync ? 0x00 : 0x80;
-                // Bits de enlace: LK1-LK4 configurados para monitor de color
-                // (valor típico: 0x5E sin VSYNC)
-                return vsync_bit | 0x5E | (row & 0x3F);
+            case 1: { // Port B (input)
+                // bit0 = VSYNC (1=activo)
+                uint8_t v = 0xFF;
+                if (ga_vsync) v |= 0x01; else v &= (uint8_t)~0x01;
+                return v;
             }
-            case 2: return ppi_portC;
-            default: return 0xFF;
+            case 2: { // Port C
+                uint8_t v = ppi_portC;
+                // Si se configura como input, flota a 1s
+                if (ppi_ctrl & 0x08) v |= 0xF0; // upper input
+                if (ppi_ctrl & 0x01) v |= 0x0F; // lower input
+                return v;
+            }
+            default: // Control (en CPC suele ser write-only)
+                return ppi_ctrl;
         }
     }
+
+    // ── CRTC 6845
+    if (sel_crtc(port)) {
+        switch (crtc_sub(port)) {
+            case 2: // &BExx status (dependiente de tipo; devolvemos FF)
+                return 0xFF;
+            case 3: // &BFxx data in (si lo soporta)
+                return (crtc_sel < 18) ? crtc_reg[crtc_sel] : 0xFF;
+            default:
+                return 0xFF;
+        }
+    }
+
+    // ── Gate Array: no legible
+    if (sel_gate_array(port)) return 0xFF;
+
     return 0xFF;
 }
 
+
+
 static void io_write_cb(z80* z, uint16_t port, uint8_t val) {
+    (void)z;
     addCycles(4);
-    uint8_t hi = port >> 8;
-    uint8_t lo = port & 0xFF;
 
-    /*
-     * ── Gate Array (40010) ────────────────────────────────────────────────────
-     *
-     * Decodificación hardware EXACTA:
-     *   El GA responde cuando A15=0 Y A14=1 en el bus de direcciones,
-     *   es decir, puerto 0x7Fxx (y cualquier espejo donde A15=0, A14=1).
-     *
-     * Los bits 7:6 del DATO determinan la función:
-     *   00 → seleccionar lápiz
-     *   01 → asignar color
-     *   10 → control (ROM, modo vídeo, reset IRQ)
-     *   11 → configuración RAM (CPC 6128 solamente)
-     */
-    if (!(hi & 0x80) && (hi & 0x40)) {          // A15=0, A14=1
+    // ── FDC motor &FA7E
+    if (is_fdc_motor(port)) { fdc_motor_control(&fdc, val); return; }
+
+    // ── FDC data &FB7F
+    if (is_fdc_data(port)) { fdc_write_data(&fdc, val); return; }
+
+    // ── Gate Array (A15=0, A14=1) → escritura
+    if (sel_gate_array(port)) {
         switch (val >> 6) {
-
-            case 0:
-                /*
-                 * Selección de lápiz:
-                 *   bits 4:0 del valor → lápiz a seleccionar
-                 *   bit4 = 1 → selección de borde (ink[16])
-                 *   bit4 = 0 → tinta ink[bits 3:0]
-                 */
+            case 0: // select pen/border
                 ga_pen = val & 0x1F;
                 break;
-
-            case 1:
-                /*
-                 * Asignación de color:
-                 *   bits 4:0 del valor → índice de paleta hardware (0-26)
-                 *   se asigna al lápiz actualmente seleccionado (ga_pen)
-                 *
-                 * Nota: el bit 5 del valor está cableado a tierra internamente
-                 * en el 40010; solo los bits 4:0 son significativos.
-                 */
+            case 1: // set colour
                 ga_ink[ga_pen & 0x1F] = val & 0x1F;
                 break;
-
-            case 2:
-                /*
-                 * Registro de control:
-                 *   bit 1:0 → modo vídeo (0, 1 ó 2)
-                 *   bit 2   → ROM lower (0=habilitada, 1=deshabilitada)
-                 *   bit 3   → ROM upper (0=habilitada, 1=deshabilitada)
-                 *   bit 4   → reset contador IRQ (pone a cero el contador de
-                 *             52 HSYNCs y cancela cualquier IRQ pendiente)
-                 *
-                 * El cambio de modo vídeo es efectivo inmediatamente (el GA
-                 * cambia el modo en el siguiente pixel de la línea activa).
-                 */
-                ga_mode      = val & 0x03;
+            case 2: { // control
+                ga_mode = val & 0x03;
                 cpc_video_mode = ga_mode;
-                rom_lo_en    = !((val >> 2) & 1);
-                rom_hi_en    = !((val >> 3) & 1);
+
+                // bit2/bit3: 0=ROM enabled, 1=ROM disabled
+                rom_lo_en = (val & 0x04) == 0;
+                rom_hi_en = (val & 0x08) == 0;
+
+                // bit4: reset IRQ
                 if (val & 0x10) {
                     ga_irq_counter = 0;
                     ga_irq_pending = false;
                 }
                 break;
-
-            case 3:
-                /*
-                 * Configuración de RAM (CPC 6128 únicamente):
-                 *   bits 2:0 → índice de configuración de mapa (0-7)
-                 *             según la tabla ram_map[][].
-                 *
-                 * Este registro solo existe en el Gate Array del 6128
-                 * (el 464 no tiene RAM adicional y no responde a estos bits).
-                 */
+            }
+            case 3: // RAM config (6128)
                 ram_cfg = val & 0x07;
                 update_vram_ptr();
                 break;
@@ -529,125 +655,93 @@ static void io_write_cb(z80* z, uint16_t port, uint8_t val) {
         return;
     }
 
-    // CRTC 6845
-    if (!(hi & 0x40) && (hi & 0x80)) {
-        if (!(hi & 0x01)) {
-            // 0xBCxx → seleccionar registro (write-only)
-            crtc_sel = val & 0x1F;
-        } else {
-            // 0xBDxx → escribir en registro seleccionado
-            if (crtc_sel < 18) crtc_reg[crtc_sel] = val;
-            // Actualizar dirección de pantalla cuando se tocan R12 / R13
-            if (crtc_sel == 12 || crtc_sel == 13) {
-                crtc_screen_addr =
-                    ((uint16_t)(crtc_reg[12] & 0x3F) << 8) | crtc_reg[13];
-            }
-        }
-        return;
-    }
-
-    // FDC – motor (0xFA7E / 0xFB7E) y datos (0xFB7F / 0xFB FF)
-    if ((hi & 0xFE) == 0xFA && (lo == 0x7E || lo == 0xFE)) {
-        fdc_motor_control(&fdc, val);
-        return;
-    }
-    if (hi == 0xFB && (lo == 0x7F || lo == 0xFF)) {
-        fdc_write_data(&fdc, val);
-        return;
-    }
-
-    // PPI 8255
-    if (!(hi & 0x08) && (hi & 0xF0) == 0xF0) {
-        uint8_t ppireg = lo & 0x03;
-        if (ppireg == 3 && (val & 0x80)) {
-            ppi_ctrl = val;
-        } else switch (ppireg) {
-            case 0:
-                ppi_portA = val;
-                {
-                    uint8_t ctrl = (ppi_portC >> 6) & 3;
-                    if      (ctrl == 3) ay_sel = val & 0x0F;
-                    else if (ctrl == 2) ay_write(ay_sel, val);
+    // ── CRTC
+    if (sel_crtc(port)) {
+        switch (crtc_sub(port)) {
+            case 0: // &BCxx index
+                crtc_sel = val & 0x1F;
+                break;
+            case 1: // &BDxx data out
+                if (crtc_sel < 18) {
+                    crtc_reg[crtc_sel] = val;
+                    if (crtc_sel == 12) crtc_screen_addr = (uint16_t)((crtc_screen_addr & 0x00FF) | ((uint16_t)val << 8));
+                    if (crtc_sel == 13) crtc_screen_addr = (uint16_t)((crtc_screen_addr & 0xFF00) | (uint16_t)val);
                 }
                 break;
-            case 1:
+            default:
+                break;
+        }
+    }
+
+    // ── PPI
+    if (sel_ppi(port)) {
+        switch (ppi_sub(port)) {
+            case 0: // Port A
+                ppi_portA = val;
+                break;
+            case 1: // Port B (latch)
                 ppi_portB = val;
                 break;
-            case 2:
+            case 2: // Port C
                 ppi_portC = val;
-                {
-                    uint8_t ctrl = (val >> 6) & 3;
-                    if      (ctrl == 3) ay_sel = ppi_portA & 0x0F;
-                    else if (ctrl == 2) ay_write(ay_sel, ppi_portA);
+                ppi_apply_psg_control();
+                break;
+            case 3: // Control
+                if (val & 0x80) {
+                    ppi_ctrl = val;
+                } else {
+                    uint8_t bit = (val >> 1) & 0x07;
+                    if (val & 0x01) ppi_portC |=  (uint8_t)(1u << bit);
+                    else            ppi_portC &= (uint8_t)~(1u << bit);
+                    ppi_apply_psg_control();
                 }
                 break;
         }
+        return;
+    }
+
+    // ── ROM select &DFxx
+    if ((port & 0xFF00) == 0xDF00) {
+        selected_upper_rom = val & 0x7F;
         return;
     }
 }
+
 
 // ── Renderizado ───────────────────────────────────────────────────────────────
 /*
  * Decodificación de píxeles – Gate Array
  * ───────────────────────────────────────
- * El Gate Array decodifica cada byte de VRAM en píxeles según el modo activo:
+ * (ver comentario de bit-layout anterior; se mantiene igual)
  *
- * MODO 0  –  160×200  –  16 colores  –  2 píxeles por byte
- *   Cada byte contiene 2 píxeles de 4 bits.
- *   El bit-layout del CPC real es:
- *     Píxel 0 (izquierda):  b7  b5  b3  b1  → bits 3,2,1,0 del índice de tinta
- *     Píxel 1 (derecha):    b6  b4  b2  b0  → bits 3,2,1,0 del índice de tinta
+ * CAMBIOS DE MODO MID-LINE
+ * ─────────────────────────
+ * render_frame() ya no usa ga_mode como valor único para todo el frame.
+ * En su lugar consulta ga_mode_per_line[y] para cada línea de escán,
+ * que fue rellenada durante la ejecución de la CPU en cpc_update().
+ * Esto permite que juegos y demos que cambian el modo en la ISR de HSYNC
+ * (o en cualquier otro momento) vean reflejado el cambio correctamente.
  *
- * MODO 1  –  320×200  –  4 colores   –  4 píxeles por byte
- *   Cada byte contiene 4 píxeles de 2 bits.
- *     Píxel 0:  b7  b3  → bits 1,0 del índice
- *     Píxel 1:  b6  b2
- *     Píxel 2:  b5  b1
- *     Píxel 3:  b4  b0
- *
- * MODO 2  –  640×200  –  2 colores   –  8 píxeles por byte
- *     Píxel N (0..7):  b(7-N)  → índice de tinta (0 ó 1)
- *
- * La dirección de cada línea en VRAM sigue el esquema del CRTC:
- *   addr_linea = base + (y >> 3) * bytes_por_char_row + (y & 7) * 0x800
- *
- * donde bytes_por_char_row = R1 del CRTC × 2  (habitualmente 80).
+ * El ancho de pantalla activo se recalcula para cada línea según su modo.
+ * El borde izquierdo/derecho se ajusta line a line.
  */
 static void render_frame(void) {
-    // Borde activo
     uint32_t border = cpc_hw_palette[ga_ink[16] & 0x1F];
 
-    // Pre-calcular los 16 colores de tinta activos (máscara 0x1F, paleta 0-26)
     uint32_t ink[16];
     for (int i = 0; i < 16; i++)
         ink[i] = cpc_hw_palette[ga_ink[i] & 0x1F];
 
-    // Resolución horizontal: depende del modo
-    int scr_cols;
-    if      (ga_mode == 0) scr_cols = 160;
-    else if (ga_mode == 1) scr_cols = 320;
-    else                   scr_cols = 640;
-
-    // Bytes por línea CRTC (R1 × 2; la unidad CRTC es de 2 bytes)
-    // R1 suele ser 40 → 80 bytes = 640 píxeles en modo 2.
     int bytes_per_row = (crtc_reg[1] ? (int)crtc_reg[1] : 40) * 2;
-
-    // Número de líneas de carácter (R6) y líneas de escán por carácter (R9+1)
-    int char_rows    = crtc_reg[6] ? crtc_reg[6] : 25;
-    int scan_per_chr = (crtc_reg[9] & 0x1F) + 1;   // normalmente 8
-    int lines        = char_rows * scan_per_chr;    // habitualmente 200
+    int char_rows     = crtc_reg[6] ? crtc_reg[6] : 25;
+    int scan_per_chr  = (crtc_reg[9] & 0x1F) + 1;
+    int lines         = char_rows * scan_per_chr;
     if (lines > CPC_H) lines = CPC_H;
 
-    // Centrado
-    int x_off = (CPC_W - scr_cols) / 2;
-    int y_off = (CPC_H - lines)    / 2;
-    if (x_off < 0) x_off = 0;
+    // Centrado vertical (basado en modo 1 de referencia = 320 px de ancho)
+    int y_off = (CPC_H - lines) / 2;
     if (y_off < 0) y_off = 0;
 
-    // Dirección base de vídeo (CRTC R12/R13).
-    // Cada unidad CRTC = 2 bytes en la VRAM.
-    // El CRTC trabaja con direcciones de 14 bits en unidades de 2 bytes.
-    // La dirección real en bytes es: (crtc_screen_addr & 0x3FF) * 2
     uint16_t base_addr = (crtc_screen_addr & 0x3FF) * 2;
 
     // ── Borde superior ────────────────────────────────────────────────────────
@@ -657,21 +751,14 @@ static void render_frame(void) {
 
     // ── Área activa ───────────────────────────────────────────────────────────
     for (int y = 0; y < lines && (y_off + y) < CPC_H; y++) {
-        /*
-         * Cálculo de dirección CRTC → VRAM:
-         *
-         * El CRTC genera la dirección de carácter así:
-         *   char_row  = y / scan_per_chr
-         *   scan_line = y % scan_per_chr
-         *
-         * La dirección de inicio de la fila de caracteres (en bytes VRAM):
-         *   row_addr  = base_addr + char_row * bytes_per_row
-         *
-         * El scan_line selecciona uno de los 8 bancos de 0x800 bytes:
-         *   vram_addr = row_addr + scan_line * 0x800
-         *
-         * Finalmente se aplica módulo 0x4000 (VRAM es de 16 KB).
-         */
+        // Modo de esta línea (puede diferir del global ga_mode)
+        uint8_t line_mode = ga_mode_per_line[y < GA_SCAN_LINES ? y : 0];
+
+        int scr_cols = (line_mode == 0) ? 160
+                     : (line_mode == 1) ? 320 : 640;
+        int x_off    = (CPC_W - scr_cols) / 2;
+        if (x_off < 0) x_off = 0;
+
         int char_row  = y / scan_per_chr;
         int scan_line = y % scan_per_chr;
         uint16_t line_addr = (uint16_t)(base_addr
@@ -683,32 +770,15 @@ static void render_frame(void) {
         // Borde izquierdo
         for (int x = 0; x < x_off; x++) row[x] = border;
 
-        // Área de píxeles activos
-        switch (ga_mode) {
-
+        // Área de píxeles activos según modo de ESTA línea
+        switch (line_mode) {
             case 0:
-                /*
-                 * Modo 0 – 160×200 – 16 colores – 2 px/byte
-                 *
-                 * Bit layout (bit más significativo a la izquierda):
-                 *   Byte:   b7 b6 b5 b4 b3 b2 b1 b0
-                 *   Pixel0: b7    b5    b3    b1      → índice[3:0]
-                 *   Pixel1:    b6    b4    b2    b0   → índice[3:0]
-                 *
-                 * Cada píxel se muestra con ancho doble (4 puntos de pantalla).
-                 */
                 for (int b = 0; b < bytes_per_row && (x_off + b*4) < CPC_W; b++) {
                     uint8_t byte = vram[(line_addr + b) & 0x3FFF];
-                    // Píxel izquierdo (par)
-                    int ci0 = ((byte >> 7) & 1) << 3 |
-                              ((byte >> 5) & 1) << 2 |
-                              ((byte >> 3) & 1) << 1 |
-                              ((byte >> 1) & 1);
-                    // Píxel derecho (impar)
-                    int ci1 = ((byte >> 6) & 1) << 3 |
-                              ((byte >> 4) & 1) << 2 |
-                              ((byte >> 2) & 1) << 1 |
-                              ((byte >> 0) & 1);
+                    int ci0 = ((byte >> 7) & 1) << 3 | ((byte >> 5) & 1) << 2 |
+                              ((byte >> 3) & 1) << 1 | ((byte >> 1) & 1);
+                    int ci1 = ((byte >> 6) & 1) << 3 | ((byte >> 4) & 1) << 2 |
+                              ((byte >> 2) & 1) << 1 | ((byte >> 0) & 1);
                     uint32_t col0 = ink[ci0 & 0xF];
                     uint32_t col1 = ink[ci1 & 0xF];
                     int px = x_off + b * 4;
@@ -718,20 +788,7 @@ static void render_frame(void) {
                     if (px+3 < CPC_W) row[px+3] = col1;
                 }
                 break;
-
             case 1:
-                /*
-                 * Modo 1 – 320×200 – 4 colores – 4 px/byte
-                 *
-                 * Bit layout:
-                 *   Byte:   b7 b6 b5 b4 b3 b2 b1 b0
-                 *   Pixel0: b7          b3          → índice[1:0]
-                 *   Pixel1:    b6          b2
-                 *   Pixel2:       b5          b1
-                 *   Pixel3:          b4          b0
-                 *
-                 * Cada píxel ocupa 2 puntos de pantalla.
-                 */
                 for (int b = 0; b < bytes_per_row && (x_off + b*4) < CPC_W; b++) {
                     uint8_t byte = vram[(line_addr + b) & 0x3FFF];
                     for (int p = 0; p < 4; p++) {
@@ -742,20 +799,7 @@ static void render_frame(void) {
                     }
                 }
                 break;
-
             case 2:
-                /*
-                 * Modo 2 – 640×200 – 2 colores – 8 px/byte
-                 *
-                 * Bit layout:
-                 *   Byte:   b7 b6 b5 b4 b3 b2 b1 b0
-                 *   Pixel0: b7
-                 *   Pixel1: b6
-                 *   ...
-                 *   Pixel7: b0
-                 *
-                 * Cada píxel ocupa 1 punto de pantalla.
-                 */
                 for (int b = 0; b < bytes_per_row && (x_off + b*8) < CPC_W; b++) {
                     uint8_t byte = vram[(line_addr + b) & 0x3FFF];
                     for (int p = 0; p < 8; p++) {
@@ -768,9 +812,9 @@ static void render_frame(void) {
         }
 
         // Borde derecho
-        int active_w = (ga_mode == 0) ? bytes_per_row * 4
-                     : (ga_mode == 1) ? bytes_per_row * 4
-                     :                  bytes_per_row * 8;  // modo 2
+        int active_w = (line_mode == 0) ? bytes_per_row * 4
+                     : (line_mode == 1) ? bytes_per_row * 4
+                     :                    bytes_per_row * 8;
         for (int x = x_off + active_w; x < CPC_W; x++) row[x] = border;
     }
 
@@ -790,35 +834,51 @@ void cpc_render(void) {
 
 // ── Frame update ──────────────────────────────────────────────────────────────
 /*
- * Generación de IRQ del Gate Array
- * ──────────────────────────────────
- * El GA cuenta los pulsos HSYNC del CRTC. Cuando llega a 52, genera una
- * interrupción Z80 (modo 1, vector 0xFF → RST 38h) y pone el contador a 0.
+ * Generación de IRQ del Gate Array – con reset por VSYNC
+ * ────────────────────────────────────────────────────────
+ * El GA cuenta los pulsos HSYNC del CRTC. Cuando llega a 52, genera IRQ.
  *
- * En hardware, el CRTC genera un HSYNC cada 64 µs (línea completa a 50 Hz).
- * A 4 MHz eso son 4.000.000 / (50 * 312) ≈ 256 ciclos por línea (total),
- * pero la línea completa del CRTC incluye blanking: el registro R0+1 = 64
- * ciclos de 1 MHz (= 256 ciclos de CPU).
- * 52 líneas × 256 ciclos = 13312 ciclos entre IRQs, pero muchos emuladores
- * usan la aproximación de 52 × 64 = 3328 t-states (asumiendo 1 ciclo CRTC
- * = 1 t-state, lo cual es incorrecto; 1 ciclo CRTC = 4 t-states Z80).
+ * RESET POR VSYNC (comportamiento hardware documentado):
+ *   Cuando el CRTC genera VSYNC (en la línea R7), el GA examina su contador:
  *
- * Valor correcto: 52 líneas × (R0+1) ciclos CRTC × 4 t-states/ciclo CRTC
- *   = 52 × 64 × 4 = 13312 t-states por IRQ.
+ *   · Si el contador está entre 0 y 31 → se fuerza a 0.
+ *     (el VSYNC llegó antes de la mitad del ciclo; se resincroniza al inicio)
  *
- * (R0 por defecto = 63, por tanto R0+1 = 64.)
+ *   · Si el contador está entre 32 y 51 → se fuerza a 32.
+ *     (el VSYNC llegó en la segunda mitad; se resincroniza al punto medio)
+ *     Esto garantiza que la siguiente IRQ llegará exactamente 20 HSYNCs
+ *     después del VSYNC, alineando el timing con el frame de 50 Hz.
+ *
+ *   Este mecanismo es lo que hace que los efectos de raster del CPC sean
+ *   estables: la ISR siempre ocurre en la misma posición relativa al frame.
+ *
+ * TABLA DE MODO POR LÍNEA (mid-line mode changes):
+ *   Antes de cada HSYNC se guarda ga_mode en ga_mode_per_line[línea_actual],
+ *   de modo que render_frame() pueda usarlo posteriormente.
+ *
+ * VSYNC para PPI:
+ *   ga_vsync se activa en la línea R7 y dura R3[7:4] HSYNCs (habitualmente
+ *   4 líneas). El bit 7 del puerto B de la PPI refleja su estado (activo bajo).
  */
 void cpc_update(void) {
     const uint32_t frame_start = cpu_cycles;
-    // Un frame completo = (R4+1)*(R9+1+1)*((R0+1)*4) ciclos
-    // Aproximación estándar: 312 líneas × 64 ciclos CRTC × 4 = 79872 t-states
     const uint32_t frame_end   = frame_start + CPC_CYCLES_FRAME;
 
-    // Ciclos entre HSYNCs = (R0+1) * 4
-    uint32_t crtc_r0   = crtc_reg[0] ? crtc_reg[0] : 63;
-    uint32_t hsync_cyc = (crtc_r0 + 1) * 4;   // habitualmente 256 t-states
+    uint32_t crtc_r0    = crtc_reg[0] ? crtc_reg[0] : 63;
+    uint32_t hsync_cyc  = (crtc_r0 + 1) * 4;    // t-states por línea (256)
 
-    uint32_t next_hsync = frame_start + hsync_cyc;
+    // Línea del CRTC en la que comienza el VSYNC (R7) y su duración (R3[7:4])
+    uint32_t vsync_line = crtc_reg[7] ? crtc_reg[7] : 30;
+    uint32_t vsync_dur  = (crtc_reg[3] >> 4) & 0x0F;
+    if (!vsync_dur) vsync_dur = 4;  // si R3[7:4]=0, el hardware usa 16 (≈4 visible)
+
+    uint32_t next_hsync  = frame_start + hsync_cyc;
+    ga_hsync_line        = 0;       // contador de línea dentro del frame
+    ga_vsync             = false;
+    ga_vsync_counter     = 0;
+
+    // Pre-rellenar la tabla de modos con el modo actual (se sobrescribirá línea a línea)
+    memset(ga_mode_per_line, ga_mode, sizeof(ga_mode_per_line));
 
     while (cpu_cycles < frame_end) {
         int cyc = z80_step(&cpu);
@@ -827,14 +887,50 @@ void cpc_update(void) {
 
         // Procesar HSYNCs pendientes
         while (cpu_cycles >= next_hsync && next_hsync < frame_end) {
+
+            // ── Registro del modo activo para esta línea (mid-line) ──────────
+            if (ga_hsync_line < GA_SCAN_LINES)
+                ga_mode_per_line[ga_hsync_line] = ga_mode;
+
+            // ── VSYNC: activación y desactivación ────────────────────────────
+            if (ga_hsync_line == vsync_line) {
+                /*
+                 * Flanco de subida de VSYNC:
+                 * El GA recibe la señal y resincroniza el contador de IRQ.
+                 *
+                 *   contador < 32  → contador = 0
+                 *   contador >= 32 → contador = 32
+                 *
+                 * En ambos casos se cancela cualquier IRQ pendiente generada
+                 * justo en este momento (el hardware tiene un latch que previene
+                 * la doble interrupción en el mismo VSYNC).
+                 */
+                if (ga_irq_counter < 32)
+                    ga_irq_counter = 0;
+                else
+                    ga_irq_counter = 32;
+                ga_irq_pending = false;
+
+                ga_vsync         = true;
+                ga_vsync_counter = (uint8_t)vsync_dur;
+            }
+            if (ga_vsync && ga_vsync_counter > 0) {
+                if (--ga_vsync_counter == 0)
+                    ga_vsync = false;
+            }
+
+            // ── Contador de IRQ del GA ────────────────────────────────────────
             ga_irq_counter++;
             if (ga_irq_counter >= 52) {
                 ga_irq_counter = 0;
                 ga_irq_pending = true;
             }
+
+            ga_hsync_line++;
             next_hsync += hsync_cyc;
         }
 
+        // Lanzar IRQ si procede (IFF1 debe estar habilitado)
         if (ga_irq_pending && cpu.iff1) {
             ga_irq_pending = false;
             z80_pulse_irq(&cpu, 0xFF);
@@ -843,11 +939,7 @@ void cpc_update(void) {
         fdc_tick(&fdc, cyc);
     }
 
-    // VSYNC: se activa durante las líneas R7 a R7+(R8 & 0x0F) del frame
-    // Para la lógica del puerto B PPI: marcamos vsync activo durante el render
-    ga_vsync = true;   // simplificación: activo durante el procesamiento
     render_frame();
-    ga_vsync = false;
     audio_flush();
 }
 
@@ -868,6 +960,9 @@ void cpc_reset(void) {
     ga_irq_counter = 0;
     ga_irq_pending = false;
     ga_vsync       = false;
+    ga_vsync_counter = 0;
+    ga_hsync_line    = 0;
+    memset(ga_mode_per_line, 1, sizeof(ga_mode_per_line));
     memset(ga_ink,   0, sizeof(ga_ink));
     memset(ay_reg,   0, sizeof(ay_reg));
     memset(crtc_reg, 0, sizeof(crtc_reg));
@@ -951,58 +1046,215 @@ int cpc_init(const char* rom_dir) {
 
 void cpc_quit(void) {}
 
-// ── Carga de snapshots ────────────────────────────────────────────────────────
+// ── Carga de snapshots .SNA ───────────────────────────────────────────────────
+/*
+ * Formato SNA – tabla de offsets (especificación oficial v1/v2/v3)
+ * ─────────────────────────────────────────────────────────────────
+ *  0x00-0x07  "MV - SNA"  (identificador, 8 bytes)
+ *  0x08-0x0F  (reservado, 0)
+ *  0x10       versión del snapshot (1, 2 ó 3)
+ *
+ *  Registros Z80 (TODOS en orden F,A,C,B,E,D,L,H,R,I – little-endian por par):
+ *  0x11  F       0x12  A       → AF  = A<<8|F
+ *  0x13  C       0x14  B       → BC  = B<<8|C
+ *  0x15  E       0x16  D       → DE  = D<<8|E
+ *  0x17  L       0x18  H       → HL  = H<<8|L
+ *  0x19  R
+ *  0x1A  I
+ *  0x1B  IFF0 (= IFF1, bit 0 significativo)
+ *  0x1C  IFF1 (= IFF2, bit 0 significativo)
+ *  0x1D  IX_lo   0x1E  IX_hi   → IX  = IX_hi<<8|IX_lo
+ *  0x1F  IY_lo   0x20  IY_hi   → IY  = IY_hi<<8|IY_lo
+ *  0x21  SP_lo   0x22  SP_hi   → SP  = SP_hi<<8|SP_lo
+ *  0x23  PC_lo   0x24  PC_hi   → PC  = PC_hi<<8|PC_lo
+ *  0x25  IM      (modo de interrupción: 0, 1 ó 2)
+ *  0x26  F'      0x27  A'      → AF' = A'<<8|F'
+ *  0x28  C'      0x29  B'      → BC' = B'<<8|C'
+ *  0x2A  E'      0x2B  D'      → DE' = D'<<8|E'
+ *  0x2C  L'      0x2D  H'      → HL' = H'<<8|L'
+ *
+ *  Gate Array:
+ *  0x2E  lápiz seleccionado (bits 4:0)
+ *  0x2F-0x3F  paleta: 16 tintas + borde (17 bytes, bits 4:0 = índice HW)
+ *  0x40  registro de control GA (modo vídeo bits 1:0, ROM lo bit2, ROM hi bit3)
+ *  0x41  configuración RAM (bits 5:0)
+ *
+ *  CRTC:
+ *  0x42  registro seleccionado (0-31)
+ *  0x43-0x54  datos de registros R0..R17 (18 bytes)
+ *
+ *  Otros:
+ *  0x55  ROM select (último valor escrito en puerto 0xDFxx)
+ *  0x56  PPI puerto A
+ *  0x57  PPI puerto B
+ *  0x58  PPI puerto C
+ *  0x59  PPI control
+ *  0x5A  PSG registro seleccionado
+ *  0x5B-0x6A  PSG registros 0-15 (16 bytes)
+ *  0x6B  tamaño del volcado de RAM en KB (byte bajo)
+ *  0x6C  tamaño del volcado de RAM en KB (byte alto)
+ *
+ *  Solo en v2/v3:
+ *  0x6D  tipo de CPC (0=464, 1=664, 2=6128, ...)
+ *  0x6E  número de interrupción (0-5) [v2]
+ *  0x6F-0x74  modos multimode por interrupción [v2]
+ *
+ *  Solo en v3:
+ *  0x9C  estado motor FDD
+ *  0xB2  GA vsync delay counter
+ *  0xB3  GA interrupt scanline counter (0-51)
+ *  0xB4  interrupt request flag
+ *
+ *  A partir de 0x100: volcado de RAM (sin dependencia de la configuración
+ *  de banking; los primeros 64 KB son siempre la RAM base 0x0000-0xFFFF
+ *  en el orden físico de bancos 0,1,2,3; los siguientes 64 KB son los
+ *  bancos extra 4,5,6,7 del CPC 6128).
+ */
+// Añadimos esta variable global/estática si no estaba para controlar la ROM superior
+
 bool cpc_load_sna(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) {
+        fprintf(stderr, "SNA: No se puede abrir '%s'", path);
+        return false;
+    }
+
     uint8_t hdr[256];
-    if (fread(hdr, 1, 256, f) != 256) { fclose(f); return false; }
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fprintf(stderr, "SNA: Cabecera incompleta");
+        fclose(f);
+        return false;
+    }
 
-    cpu.af   = ((uint16_t)hdr[0x11] << 8) | hdr[0x10];
-    cpu.bc   = ((uint16_t)hdr[0x13] << 8) | hdr[0x12];
-    cpu.de   = ((uint16_t)hdr[0x15] << 8) | hdr[0x14];
-    cpu.hl   = ((uint16_t)hdr[0x17] << 8) | hdr[0x16];
-    cpu.a_f_ = ((uint16_t)hdr[0x1B] << 8) | hdr[0x1A];
-    cpu.b_c_ = ((uint16_t)hdr[0x1D] << 8) | hdr[0x1C];
-    cpu.d_e_ = ((uint16_t)hdr[0x1F] << 8) | hdr[0x1E];
-    cpu.h_l_ = ((uint16_t)hdr[0x21] << 8) | hdr[0x20];
-    cpu.ix   = ((uint16_t)hdr[0x23] << 8) | hdr[0x22];
-    cpu.iy   = ((uint16_t)hdr[0x25] << 8) | hdr[0x24];
-    cpu.sp   = ((uint16_t)hdr[0x27] << 8) | hdr[0x26];
-    cpu.pc   = ((uint16_t)hdr[0x29] << 8) | hdr[0x28];
-    cpu.interrupt_mode = hdr[0x33];
-    cpu.iff1 = hdr[0x34] & 1;
-    cpu.iff2 = hdr[0x35] & 1;
+    if (memcmp(hdr, "MV - SNA", 8) != 0) {
+        fprintf(stderr, "SNA: Identificador inválido");
+        fclose(f);
+        return false;
+    }
 
-    // Gate Array desde el header SNA
-    ga_mode = hdr[0x6D] & 3;
+    const uint8_t version = hdr[0x10];
+
+    #define LE16(p) ((uint16_t)(p)[0] | ((uint16_t)(p)[1] << 8))
+
+    // ── Estado CPU (jgz80) ───────────────────────────────────────────────
+    cpu.halted      = false;
+    cpu.irq_pending = 0;
+    cpu.nmi_pending = 0;
+    cpu.irq_data    = 0;
+    cpu.iff_delay   = 0;
+
+    cpu.f = hdr[0x11]; cpu.a = hdr[0x12];
+    cpu.c = hdr[0x13]; cpu.b = hdr[0x14];
+    cpu.e = hdr[0x15]; cpu.d = hdr[0x16];
+    cpu.l = hdr[0x17]; cpu.h = hdr[0x18];
+
+    cpu.r = hdr[0x19];
+    cpu.i = hdr[0x1A];
+    cpu.iff1 = (hdr[0x1B] & 1) != 0;
+    cpu.iff2 = (hdr[0x1C] & 1) != 0;
+
+    cpu.ix = LE16(&hdr[0x1D]);
+    cpu.iy = LE16(&hdr[0x1F]);
+    cpu.sp = LE16(&hdr[0x21]);
+    cpu.pc = LE16(&hdr[0x23]);
+
+    cpu.interrupt_mode = hdr[0x25] & 3;
+
+    cpu.f_ = hdr[0x26]; cpu.a_ = hdr[0x27];
+    cpu.c_ = hdr[0x28]; cpu.b_ = hdr[0x29];
+    cpu.e_ = hdr[0x2A]; cpu.d_ = hdr[0x2B];
+    cpu.l_ = hdr[0x2C]; cpu.h_ = hdr[0x2D];
+
+    cpu.mem_ptr = cpu.pc;
+
+    // ── Gate Array / banking ─────────────────────────────────────────────
+    ga_pen = hdr[0x2E] & 0x1F;
+    for (int i = 0; i < 17; i++) ga_ink[i] = hdr[0x2F + i] & 0x1F;
+
+    const uint8_t ga_ctrl = hdr[0x40];
+    ga_mode        = ga_ctrl & 0x03;
     cpc_video_mode = ga_mode;
+    rom_lo_en      = (ga_ctrl & 0x04) == 0;
+    rom_hi_en      = (ga_ctrl & 0x08) == 0;
 
-    // Colores de la paleta del snapshot
-    for (int i = 0; i < 17; i++)
-        ga_ink[i] = hdr[0x2F + i] & 0x1F;
+    ram_cfg = hdr[0x41] & 0x07;
+    selected_upper_rom = hdr[0x55] & 0x7F;
 
-    // Registro de control del GA
-    rom_lo_en = !((hdr[0x6D] >> 2) & 1);
-    rom_hi_en = !((hdr[0x6D] >> 3) & 1);
+    // ── CRTC ─────────────────────────────────────────────────────────────
+    crtc_sel = hdr[0x42] & 0x1F;
+    for (int i = 0; i < 18; i++) crtc_reg[i] = hdr[0x43 + i];
+    crtc_screen_addr = ((uint16_t)(crtc_reg[12] & 0x3F) << 8) | crtc_reg[13];
 
-    // Registros CRTC
-    for (int i = 0; i < 18; i++)
-        crtc_reg[i] = hdr[0x50 + i];
-    crtc_screen_addr =
-        ((uint16_t)(crtc_reg[12] & 0x3F) << 8) | crtc_reg[13];
+    // ── PPI / PSG ─────────────────────────────────────────────────────────
+    ppi_portA = hdr[0x56];
+    ppi_portB = hdr[0x57];
+    ppi_portC = hdr[0x58];
+    ppi_ctrl  = hdr[0x59];
 
-    // RAM
-    uint32_t total_ram = ((uint32_t)hdr[0x6B] << 8) | hdr[0x6A];
-    for (uint32_t b = 0; b * 16384 < total_ram && b < RAM_BANKS; b++)
-        fread(ram[b], 1, 16384, f);
+    ay_sel = hdr[0x5A] & 0x0F;
+    for (int r = 0; r < 16; r++) ay_write((uint8_t)r, hdr[0x5B + r]);
+
+    // ── RAM dump ──────────────────────────────────────────────────────────
+    uint32_t ram_kb = ((uint32_t)hdr[0x6C] << 8) | hdr[0x6B];
+    if (ram_kb == 0) ram_kb = 64;
+    if (ram_kb > 128) ram_kb = 128;
+
+    uint32_t banks_to_load = ram_kb / 16;
+    if (banks_to_load > RAM_BANKS) banks_to_load = RAM_BANKS;
+
+    long cur = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, cur, SEEK_SET);
+
+    long need = 0x100 + (long)banks_to_load * (long)BANK_SIZE;
+    if (fsize < need) {
+        fprintf(stderr, "SNA: fichero truncado (tamaño=%ld, esperado>=%ld)", fsize, need);
+        fclose(f);
+        return false;
+    }
+
+    if (fseek(f, 0x100, SEEK_SET) != 0) {
+        fprintf(stderr, "SNA: error posicionando RAM");
+        fclose(f);
+        return false;
+    }
+
+    for (uint32_t b = 0; b < banks_to_load; b++) {
+        size_t rd = fread(ram[b], 1, BANK_SIZE, f);
+        if (rd != BANK_SIZE) {
+            fprintf(stderr, "SNA: error leyendo RAM bank %u", (unsigned)b);
+            fclose(f);
+            return false;
+        }
+    }
 
     fclose(f);
+
+    // ── Estado extra v3 ───────────────────────────────────────────────────
+    if (version >= 3) {
+        ga_vsync_counter = hdr[0xB2] & 0x03;
+        ga_irq_counter   = hdr[0xB3] & 0x3F;
+        ga_irq_pending   = (hdr[0xB4] & 1) != 0;
+    } else {
+        ga_irq_counter = 0;
+        ga_irq_pending = false;
+    }
+
     update_vram_ptr();
-    printf("CPC SNA cargado: %s PC=0x%04X modo=%d\n",
-           path, cpu.pc, ga_mode);
+    memset(ga_mode_per_line, ga_mode, sizeof(ga_mode_per_line));
+
+    cpu_cycles   = 0;
+    audio_next_t = 0.0;
+
+    #undef LE16
+
+    printf("SNA cargado: v%u PC=0x%04X SP=0x%04X RAM=%uKB ROMsel=%u",
+           (unsigned)version, cpu.pc, cpu.sp, (unsigned)ram_kb, (unsigned)selected_upper_rom);
+
     return true;
 }
+
 
 bool cpc_load_dsk(const char* path) {
     return fdc_load_dsk(&fdc, 0, path);
