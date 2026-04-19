@@ -322,7 +322,7 @@ int main(int argc, char** argv){
     SDL_SetWindowMinimumSize(msx_window,MSX_W,MSX_H);
 
     msx_renderer=SDL_CreateRenderer(msx_window,-1,
-        SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_ACCELERATED);
     SDL_RenderSetLogicalSize(msx_renderer,MSX_W,MSX_H);
 
     msx_texture=SDL_CreateTexture(msx_renderer,SDL_PIXELFORMAT_ARGB8888,
