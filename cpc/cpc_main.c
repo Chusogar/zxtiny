@@ -56,68 +56,148 @@ static void audio_throttle(void) {
 // Cada entrada: {fila, bit}
 // Solo mapeamos las teclas más comunes
 typedef struct { int row; int bit; } KeyPos;
+#if 0
+  protected static final int[] KEY_MAP = {
+    // Row 0
+    KeyEvent.VK_UP, KeyEvent.VK_RIGHT, KeyEvent.VK_DOWN, KeyEvent.VK_NUMPAD9,
+    KeyEvent.VK_NUMPAD6, KeyEvent.VK_NUMPAD3, KeyEvent.VK_END, KeyEvent.VK_DECIMAL,
+
+    // Row 1
+    KeyEvent.VK_LEFT, KeyEvent.VK_ALT, KeyEvent.VK_NUMPAD7, KeyEvent.VK_NUMPAD8,
+    KeyEvent.VK_NUMPAD5, KeyEvent.VK_NUMPAD1, KeyEvent.VK_NUMPAD2, KeyEvent.VK_NUMPAD0,
+
+    // Row 2
+    KeyEvent.VK_BACK_SLASH, KeyEvent.VK_ALT_GRAPH, KeyEvent.VK_ENTER,
+    KeyEvent.VK_CLOSE_BRACKET, KeyEvent.VK_NUMPAD4, KeyEvent.VK_SHIFT,
+    KeyEvent.VK_BACK_QUOTE, KeyEvent.VK_CONTROL,
+
+    // Row 3
+    KeyEvent.VK_EQUALS, KeyEvent.VK_MINUS, KeyEvent.VK_OPEN_BRACKET, KeyEvent.VK_P,
+    KeyEvent.VK_QUOTE, KeyEvent.VK_SEMICOLON, KeyEvent.VK_SLASH, KeyEvent.VK_PERIOD,
+
+    // Row 4
+    KeyEvent.VK_0, KeyEvent.VK_9, KeyEvent.VK_O, KeyEvent.VK_I,
+    KeyEvent.VK_L, KeyEvent.VK_K, KeyEvent.VK_M, KeyEvent.VK_COMMA,
+
+    // Row 5
+    KeyEvent.VK_8, KeyEvent.VK_7, KeyEvent.VK_U, KeyEvent.VK_Y,
+    KeyEvent.VK_H, KeyEvent.VK_J, KeyEvent.VK_N, KeyEvent.VK_SPACE,
+
+    // Row 6
+    KeyEvent.VK_6, KeyEvent.VK_5, KeyEvent.VK_R, KeyEvent.VK_T,
+    KeyEvent.VK_G, KeyEvent.VK_F, KeyEvent.VK_B, KeyEvent.VK_V,
+
+    // Row 7
+    KeyEvent.VK_4, KeyEvent.VK_3, KeyEvent.VK_E, KeyEvent.VK_W,
+    KeyEvent.VK_S, KeyEvent.VK_D, KeyEvent.VK_C, KeyEvent.VK_X,
+
+    // Row 8
+    KeyEvent.VK_1, KeyEvent.VK_2, KeyEvent.VK_ESCAPE, KeyEvent.VK_Q,
+    KeyEvent.VK_TAB, KeyEvent.VK_A, KeyEvent.VK_CAPS_LOCK, KeyEvent.VK_Z,
+
+    // Row 9
+    -1, -1, -1, -1, -1, -1, -1, KeyEvent.VK_BACK_SPACE
+  };
+#endif
 
 static void cpc_key(SDL_Keycode sym, bool press) {
     // Matriz CPC estándar (simplificada - filas 0-9, bits 0-7)
     int row=-1, bit=-1;
     switch(sym) {
-        // Fila 0: CURSOR-UP, CURSOR-RIGHT, CURSOR-DOWN, F9, F6, F3, ENTER(num), .
+		// Fila 0
         case SDLK_UP:     row=0;bit=0;break;
         case SDLK_RIGHT:  row=0;bit=1;break;
         case SDLK_DOWN:   row=0;bit=2;break;
-        // Fila 1: CURSOR-LEFT, COPY, F7, F8, F5, F1, F2, F0
-        case SDLK_LEFT:   row=1;bit=0;break;
-        // Fila 2: CAPS-LK, A, TAB, Q, Z, W, S, X (letras fila izq)
-        case SDLK_a:      row=8;bit=5;break;
-        case SDLK_q:      row=2;bit=3;break;
-        case SDLK_z:      row=2;bit=4;break;
-        case SDLK_w:      row=2;bit=5;break;
-        case SDLK_s:      row=2;bit=6;break;
-        case SDLK_x:      row=2;bit=7;break;
-        // Fila 3: DEL, J3, LOCK, F4, SHIFT, F7(joy?), E, D, C
-        case SDLK_e:      row=3;bit=6;break;
-        case SDLK_d:      row=3;bit=7;break;
-        // Fila 4: 3, 4, R, F, V, (espacio izq)
-        case SDLK_3:      row=4;bit=0;break;
-        case SDLK_4:      row=4;bit=1;break;
-        case SDLK_r:      row=4;bit=2;break;
-        case SDLK_f:      row=4;bit=3;break;
-        case SDLK_v:      row=4;bit=4;break;
-        case SDLK_c:      row=7;bit=6;break;
-        // Fila 5: 5, 6, T, G, B
-        case SDLK_5:      row=5;bit=0;break;
-        case SDLK_6:      row=5;bit=1;break;
-        case SDLK_t:      row=6;bit=3;break;
-        case SDLK_g:      row=5;bit=3;break;
-        case SDLK_b:      row=5;bit=4;break;
-        // Fila 6: SPACE, 7, Y, H, N
-        case SDLK_SPACE:  row=6;bit=0;break;
-        case SDLK_7:      row=6;bit=1;break;
-        case SDLK_y:      row=6;bit=2;break;
-        case SDLK_h:      row=6;bit=3;break;
-        case SDLK_n:      row=6;bit=4;break;
-        // Fila 7: 8, 9, U, I, O, M, K, J
-        case SDLK_8:      row=7;bit=0;break;
-        case SDLK_9:      row=7;bit=1;break;
-        case SDLK_u:      row=7;bit=2;break;
-        case SDLK_i:      row=7;bit=3;break;
-        case SDLK_o:      row=7;bit=4;break;
-        case SDLK_m:      row=7;bit=5;break;
-        case SDLK_k:      row=7;bit=6;break;
-        case SDLK_j:      row=7;bit=7;break;
-        // Fila 8: 0, -, P, @, [, :, ;, /
-        case SDLK_0:      row=8;bit=0;break;
-        case SDLK_p:      row=8;bit=3;break;
-        // Fila 9: DEL, ^, -, ], RETURN, \, L, '
-        case SDLK_RETURN: row=2;bit=2;break;
-        case SDLK_l:      row=9;bit=5;break;
-        // Shifts
-        case SDLK_LSHIFT:
-        case SDLK_RSHIFT: row=2;bit=5;break;   // CPC SHIFT = fila 2 bit 5
-        case SDLK_LCTRL:
-        case SDLK_RCTRL:  row=2;bit=2;break;   // CTRL
-        case SDLK_1:      row=9;bit=0;break;
-        case SDLK_2:      row=9;bit=1;break;
+		//KeyEvent.VK_NUMPAD9
+		//KeyEvent.VK_NUMPAD6
+		//KeyEvent.VK_NUMPAD3
+		//KeyEvent.VK_END
+		//KeyEvent.VK_DECIMAL
+        
+		// Fila 1
+		case SDLK_LEFT:   row=1;bit=0;break;
+		//KeyEvent.VK_ALT
+		//KeyEvent.VK_NUMPAD7
+		//KeyEvent.VK_NUMPAD8
+		//KeyEvent.VK_NUMPAD5
+		//KeyEvent.VK_NUMPAD1
+		//KeyEvent.VK_NUMPAD2
+		//KeyEvent.VK_NUMPAD0,
+        
+        // Fila 2
+		//KeyEvent.VK_BACK_SLASH
+		//KeyEvent.VK_ALT_GRAPH
+		case SDLK_RETURN: row=2;bit=2;break;
+		//KeyEvent.VK_CLOSE_BRACKET
+		//KeyEvent.VK_NUMPAD4
+		case SDLK_LSHIFT: row=2;bit=5;break;//KeyEvent.VK_SHIFT,
+		case SDLK_RSHIFT: row=2;bit=5;break;//KeyEvent.VK_SHIFT,
+		//KeyEvent.VK_BACK_QUOTE
+		//KeyEvent.VK_CONTROL,
+        
+		// Fila 3
+		//KeyEvent.VK_EQUALS
+		//KeyEvent.VK_MINUS
+		//KeyEvent.VK_OPEN_BRACKET
+		case SDLK_p:      row=3;bit=3;break;//KeyEvent.VK_P,
+		//KeyEvent.VK_QUOTE
+		//KeyEvent.VK_SEMICOLON
+		//KeyEvent.VK_SLASH
+		//KeyEvent.VK_PERIOD,
+        
+		// Fila 4
+		case SDLK_0:      row=4;bit=0;break;//KeyEvent.VK_0
+		case SDLK_9:      row=4;bit=1;break;//KeyEvent.VK_9
+		case SDLK_o:      row=4;bit=2;break;//KeyEvent.VK_O
+		case SDLK_i:      row=4;bit=3;break;//KeyEvent.VK_I
+		case SDLK_l:      row=4;bit=4;break;//KeyEvent.VK_L
+		case SDLK_k:      row=4;bit=5;break;//KeyEvent.VK_K
+		case SDLK_m:      row=4;bit=6;break;//KeyEvent.VK_M
+		case SDLK_COMMA:      row=4;bit=7;break;//KeyEvent.VK_COMMA,
+        
+		// Fila 5
+		case SDLK_8:      row=5;bit=0;break;//KeyEvent.VK_8
+		case SDLK_7:      row=5;bit=1;break;//KeyEvent.VK_7
+		case SDLK_u:      row=5;bit=2;break;//KeyEvent.VK_U
+		case SDLK_y:      row=5;bit=3;break;//KeyEvent.VK_Y,
+		case SDLK_h:      row=5;bit=4;break;//KeyEvent.VK_H
+		case SDLK_j:      row=5;bit=5;break;//KeyEvent.VK_J
+		case SDLK_n:      row=5;bit=6;break;//KeyEvent.VK_N
+		case SDLK_SPACE:      row=5;bit=7;break;//KeyEvent.VK_SPACE
+        
+		// Fila 6
+		case SDLK_6:  row=6;bit=0;break;//KeyEvent.VK_6
+		case SDLK_5:  row=6;bit=1;break;//KeyEvent.VK_5
+		case SDLK_r:  row=6;bit=2;break;//KeyEvent.VK_R
+		case SDLK_t:  row=6;bit=3;break;//KeyEvent.VK_T,
+		case SDLK_g:  row=6;bit=4;break;//KeyEvent.VK_G
+		case SDLK_f:  row=6;bit=5;break;//KeyEvent.VK_F
+		case SDLK_b:  row=6;bit=6;break;//KeyEvent.VK_B
+		case SDLK_v:  row=6;bit=7;break;//KeyEvent.VK_V,
+        
+		// Fila 7
+		case SDLK_4:      row=7;bit=0;break;//KeyEvent.VK_4
+		case SDLK_3:      row=7;bit=1;break;//KeyEvent.VK_3
+		case SDLK_e:      row=7;bit=2;break;//KeyEvent.VK_E
+		case SDLK_w:      row=7;bit=3;break;//KeyEvent.VK_W,
+		case SDLK_s:      row=7;bit=4;break;//KeyEvent.VK_S
+		case SDLK_d:      row=7;bit=5;break;//KeyEvent.VK_D
+		case SDLK_c:      row=7;bit=6;break;//KeyEvent.VK_C
+		case SDLK_x:      row=7;bit=7;break;//KeyEvent.VK_X
+        
+		// Fila 8
+		case SDLK_1:      row=8;bit=0;break;//KeyEvent.VK_1
+		case SDLK_2:      row=8;bit=1;break;//KeyEvent.VK_2
+		case SDLK_ESCAPE:      row=8;bit=2;break;//KeyEvent.VK_ESCAPE
+		case SDLK_q:      row=8;bit=3;break;//KeyEvent.VK_Q,
+		case SDLK_TAB:      row=8;bit=4;break;//KeyEvent.VK_TAB
+		case SDLK_a:      row=8;bit=5;break;//KeyEvent.VK_A
+		case SDLK_CAPSLOCK:      row=8;bit=6;break;//KeyEvent.VK_CAPS_LOCK
+		case SDLK_z:      row=8;bit=7;break;//KeyEvent.VK_Z
+        
+		// Fila 9: DEL, ^, -, ], RETURN, \, L, '
+        case SDLK_BACKSPACE:      row=9;bit=7;break;
+        
         default: break;
     }
     if (row>=0 && bit>=0) {

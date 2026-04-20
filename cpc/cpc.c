@@ -727,6 +727,7 @@ static void io_write_cb(z80* z, uint16_t port, uint8_t val) {
  */
 static void render_frame(void) {
     uint32_t border = cpc_hw_palette[ga_ink[16] & 0x1F];
+	printf("Mode: %d\n", ga_mode);
 
     uint32_t ink[16];
     for (int i = 0; i < 16; i++)
@@ -752,7 +753,8 @@ static void render_frame(void) {
     // ── Área activa ───────────────────────────────────────────────────────────
     for (int y = 0; y < lines && (y_off + y) < CPC_H; y++) {
         // Modo de esta línea (puede diferir del global ga_mode)
-        uint8_t line_mode = ga_mode_per_line[y < GA_SCAN_LINES ? y : 0];
+        //uint8_t line_mode = ga_mode_per_line[y < GA_SCAN_LINES ? y : 0];
+		uint8_t line_mode = ga_mode;
 
         int scr_cols = (line_mode == 0) ? 160
                      : (line_mode == 1) ? 320 : 640;
