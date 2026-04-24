@@ -31,7 +31,7 @@
 // Área visible estándar: 768×272 px (modo 2 máx.) → escalado a 384×272
 #define CPC_W       384
 #define CPC_H       272
-#define CPC_SCALE     2
+#define CPC_SCALE     1
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 #define CPC_CLOCK_HZ    4000000

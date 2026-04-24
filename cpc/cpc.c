@@ -194,40 +194,42 @@ static uint8_t ga_mode_per_line[GA_SCAN_LINES];  // modo activo en cada línea
  */
 // Paleta física del CPC (27 colores en ARGB)
 static const uint32_t cpc_hw_palette[32] = {
-    0xFF6B7D6E, // 0  Gris (Bright White en hardware real)
-    0xFF6B7D6E, // 1  Gris
-    0xFF00FF6B, // 2  Verde brillante
-    0xFFFFFF6B, // 3  Amarillo brillante
-    0xFF00006B, // 4  Azul oscuro
-    0xFFFF006B, // 5  Rosa / Magenta
-    0xFF006B00, // 6  Verde oscuro
-    0xFFFF6B00, // 7  Naranja
-    0xFF6B7DFF, // 8  Azul pastel
-    0xFF6BFFFF, // 9  Cian pastel
-    0xFF00FFFF, // 10 Cian brillante
-    0xFFFFFF6B, // 11 Amarillo brillante (repetido)
-    0xFF0000FF, // 12 Azul brillante
-    0xFFFF00FF, // 13 Magenta brillante
-    0xFF00FF00, // 14 Verde puro
-    0xFFFFFF00, // 15 Amarillo puro
-    0xFF000000, // 16 Negro
-    0xFF0000FF, // 17 Azul puro
-    0xFF00FFFF, // 18 Cian puro
-    0xFFFFFF00, // 19 Amarillo puro (repetido)
-    0xFF6B0000, // 20 Rojo oscuro
-    0xFF6B006B, // 21 Púrpura
-    0xFF6B6B00, // 22 Marrón / Verde barro
-    0xFF6B6B6B, // 23 Gris oscuro
-    0xFF6B00FF, // 24 Púrpura brillante
-    0xFFFF00FF, // 25 Magenta (repetido)
-    0xFFFFFF00, // 26 Amarillo brillante (repetido)
-    0xFFFFFFFF, // 27 Blanco puro
-    0xFF00006B, // 28 Azul oscuro (repetido)
-    0xFFFF006B, // 29 Magenta (repetido)
-    0xFF006B00, // 30 Verde oscuro (repetido)
-    0xFFFF6B00  // 31 Naranja (repetido)
+    // Paleta hardware Gate Array (0..31).
+    // Niveles: 0% = 0x00, 50% = 0x66 (#6), 100% = 0xFF (#F).
+    // Basada en la tabla de mezcla RGB del Gate Array (CPCWiki/CPC-Tech).
+    0xFF666666, //  0 White
+    0xFF666666, //  1 White (dup)
+    0xFF00FF66, //  2 Sea Green
+    0xFFFFFF66, //  3 Pastel Yellow
+    0xFF000066, //  4 Blue
+    0xFFFF0066, //  5 Purple
+    0xFF006666, //  6 Cyan
+    0xFFFF6666, //  7 Pink
+    0xFFFF0066, //  8 Purple (dup)
+    0xFFFFFF66, //  9 Pastel Yellow (dup)
+    0xFFFFFF00, // 10 Bright Yellow
+    0xFFFFFFFF, // 11 Bright White
+    0xFFFF0000, // 12 Bright Red
+    0xFFFF00FF, // 13 Bright Magenta
+    0xFFFF6600, // 14 Orange
+    0xFFFF66FF, // 15 Pastel Magenta
+    0xFF000066, // 16 Blue (dup)
+    0xFF00FF66, // 17 Sea Green (dup)
+    0xFF00FF00, // 18 Bright Green
+    0xFF00FFFF, // 19 Bright Cyan
+    0xFF000000, // 20 Black
+    0xFF0000FF, // 21 Bright Blue
+    0xFF006600, // 22 Green
+    0xFF0066FF, // 23 Sky Blue
+    0xFF660066, // 24 Magenta
+    0xFF66FF66, // 25 Pastel Green
+    0xFF66FF00, // 26 Lime
+    0xFF66FFFF, // 27 Pastel Cyan
+    0xFF660000, // 28 Red
+    0xFF6600FF, // 29 Mauve
+    0xFF666600, // 30 Yellow
+    0xFF6666FF, // 31 Pastel Blue
 };
-
 // ── AY-3-8912 ─────────────────────────────────────────────────────────────────
 static uint8_t ay_reg[16];
 static uint8_t ay_sel = 0;
@@ -629,9 +631,13 @@ static void io_write_cb(z80* z, uint16_t port, uint8_t val) {
             case 0: // select pen/border
                 ga_pen = val & 0x1F;
                 break;
-            case 1: // set colour
-                ga_ink[ga_pen & 0x1F] = val & 0x1F;
+            case 1: { // set colour
+                // bit4=1 => borde (ink[16]), bit4=0 => tinta 0..15
+                // ga_ink tiene 17 entradas: 0..16 (16=borde)
+                int idx = (ga_pen & 0x10) ? 16 : (ga_pen & 0x0F);
+                ga_ink[idx] = val & 0x1F;
                 break;
+            }
             case 2: { // control
                 ga_mode = val & 0x03;
                 cpc_video_mode = ga_mode;
@@ -727,8 +733,6 @@ static void io_write_cb(z80* z, uint16_t port, uint8_t val) {
  */
 static void render_frame(void) {
     uint32_t border = cpc_hw_palette[ga_ink[16] & 0x1F];
-	printf("Mode: %d\n", ga_mode);
-
     uint32_t ink[16];
     for (int i = 0; i < 16; i++)
         ink[i] = cpc_hw_palette[ga_ink[i] & 0x1F];
@@ -754,11 +758,11 @@ static void render_frame(void) {
     for (int y = 0; y < lines && (y_off + y) < CPC_H; y++) {
         // Modo de esta línea (puede diferir del global ga_mode)
         //uint8_t line_mode = ga_mode_per_line[y < GA_SCAN_LINES ? y : 0];
-		uint8_t line_mode = ga_mode;
+		uint8_t line_mode = ga_mode_per_line[(y < GA_SCAN_LINES) ? y : 0] & 0x03;
+        int active_w = (line_mode == 2) ? (bytes_per_row * 8) : (bytes_per_row * 4);
+        if (active_w > CPC_W) active_w = CPC_W;
 
-        int scr_cols = (line_mode == 0) ? 160
-                     : (line_mode == 1) ? 320 : 640;
-        int x_off    = (CPC_W - scr_cols) / 2;
+        int x_off    = (CPC_W - active_w) / 2;
         if (x_off < 0) x_off = 0;
 
         int char_row  = y / scan_per_chr;
@@ -814,9 +818,6 @@ static void render_frame(void) {
         }
 
         // Borde derecho
-        int active_w = (line_mode == 0) ? bytes_per_row * 4
-                     : (line_mode == 1) ? bytes_per_row * 4
-                     :                    bytes_per_row * 8;
         for (int x = x_off + active_w; x < CPC_W; x++) row[x] = border;
     }
 
@@ -1114,149 +1115,56 @@ void cpc_quit(void) {}
  */
 // Añadimos esta variable global/estática si no estaba para controlar la ROM superior
 
+// ── Carga de Snapshots .SNA (CORREGIDO) ──────────────────────────────────────
 bool cpc_load_sna(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "SNA: No se puede abrir '%s'", path);
-        return false;
-    }
-
+    if (!f) return false;
     uint8_t hdr[256];
-    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
-        fprintf(stderr, "SNA: Cabecera incompleta");
-        fclose(f);
-        return false;
-    }
+    if (fread(hdr, 1, 256, f) != 256 || memcmp(hdr, "MV - SNA", 8) != 0) { fclose(f); return false; }
 
-    if (memcmp(hdr, "MV - SNA", 8) != 0) {
-        fprintf(stderr, "SNA: Identificador inválido");
-        fclose(f);
-        return false;
-    }
-
-    const uint8_t version = hdr[0x10];
-
-    #define LE16(p) ((uint16_t)(p)[0] | ((uint16_t)(p)[1] << 8))
-
-    // ── Estado CPU (jgz80) ───────────────────────────────────────────────
-    cpu.halted      = false;
-    cpu.irq_pending = 0;
-    cpu.nmi_pending = 0;
-    cpu.irq_data    = 0;
-    cpu.iff_delay   = 0;
-
-    cpu.f = hdr[0x11]; cpu.a = hdr[0x12];
-    cpu.c = hdr[0x13]; cpu.b = hdr[0x14];
-    cpu.e = hdr[0x15]; cpu.d = hdr[0x16];
-    cpu.l = hdr[0x17]; cpu.h = hdr[0x18];
-
-    cpu.r = hdr[0x19];
-    cpu.i = hdr[0x1A];
-    cpu.iff1 = (hdr[0x1B] & 1) != 0;
-    cpu.iff2 = (hdr[0x1C] & 1) != 0;
-
-    cpu.ix = LE16(&hdr[0x1D]);
-    cpu.iy = LE16(&hdr[0x1F]);
-    cpu.sp = LE16(&hdr[0x21]);
-    cpu.pc = LE16(&hdr[0x23]);
-
+    // Registros CPU (Usando nombres exactos de tu struct z80)
+    cpu.f = hdr[0x11]; cpu.a = hdr[0x12]; cpu.c = hdr[0x13]; cpu.b = hdr[0x14];
+    cpu.e = hdr[0x15]; cpu.d = hdr[0x16]; cpu.l = hdr[0x17]; cpu.h = hdr[0x18];
+    cpu.r = hdr[0x19]; cpu.i = hdr[0x1A]; cpu.iff1 = hdr[0x1B] & 1; cpu.iff2 = hdr[0x1C] & 1;
+    cpu.ix = hdr[0x1D] | (hdr[0x1E] << 8); cpu.iy = hdr[0x1F] | (hdr[0x20] << 8);
+    cpu.sp = hdr[0x21] | (hdr[0x22] << 8); cpu.pc = hdr[0x23] | (hdr[0x24] << 8);
     cpu.interrupt_mode = hdr[0x25] & 3;
+    cpu.f_ = hdr[0x26]; cpu.a_ = hdr[0x27]; cpu.c_ = hdr[0x28]; cpu.b_ = hdr[0x29];
+    cpu.e_ = hdr[0x2A]; cpu.d_ = hdr[0x2B]; cpu.l_ = hdr[0x2C]; cpu.h_ = hdr[0x2D];
 
-    cpu.f_ = hdr[0x26]; cpu.a_ = hdr[0x27];
-    cpu.c_ = hdr[0x28]; cpu.b_ = hdr[0x29];
-    cpu.e_ = hdr[0x2A]; cpu.d_ = hdr[0x2B];
-    cpu.l_ = hdr[0x2C]; cpu.h_ = hdr[0x2D];
-
-    cpu.mem_ptr = cpu.pc;
-
-    // ── Gate Array / banking ─────────────────────────────────────────────
+    // Hardware State
     ga_pen = hdr[0x2E] & 0x1F;
-    for (int i = 0; i < 17; i++) ga_ink[i] = hdr[0x2F + i] & 0x1F;
+    for(int i=0; i<17; i++) ga_ink[i] = hdr[0x2F+i] & 0x1F;
+    ga_mode = hdr[0x40] & 3; rom_lo_en = !(hdr[0x40] & 4); rom_hi_en = !(hdr[0x40] & 8);
+    ram_cfg = hdr[0x41] & 7; selected_upper_rom = hdr[0x55] & 0x7F;
 
-    const uint8_t ga_ctrl = hdr[0x40];
-    ga_mode        = ga_ctrl & 0x03;
-    cpc_video_mode = ga_mode;
-    rom_lo_en      = (ga_ctrl & 0x04) == 0;
-    rom_hi_en      = (ga_ctrl & 0x08) == 0;
-
-    ram_cfg = hdr[0x41] & 0x07;
-    selected_upper_rom = hdr[0x55] & 0x7F;
-
-    // ── CRTC ─────────────────────────────────────────────────────────────
     crtc_sel = hdr[0x42] & 0x1F;
-    for (int i = 0; i < 18; i++) crtc_reg[i] = hdr[0x43 + i];
+    for(int i=0; i<18; i++) crtc_reg[i] = hdr[0x43+i];
     crtc_screen_addr = ((uint16_t)(crtc_reg[12] & 0x3F) << 8) | crtc_reg[13];
 
-    // ── PPI / PSG ─────────────────────────────────────────────────────────
-    ppi_portA = hdr[0x56];
-    ppi_portB = hdr[0x57];
-    ppi_portC = hdr[0x58];
-    ppi_ctrl  = hdr[0x59];
-
+    ppi_portA = hdr[0x56]; ppi_portB = hdr[0x57]; ppi_portC = hdr[0x58]; ppi_ctrl = hdr[0x59];
     ay_sel = hdr[0x5A] & 0x0F;
-    for (int r = 0; r < 16; r++) ay_write((uint8_t)r, hdr[0x5B + r]);
+    for(int i=0; i<16; i++) ay_write(i, hdr[0x5B+i]);
 
-    // ── RAM dump ──────────────────────────────────────────────────────────
-    uint32_t ram_kb = ((uint32_t)hdr[0x6C] << 8) | hdr[0x6B];
+    // RAM Banks (v2/v3 suelen tener 128KB si es CPC 6128)
+    uint32_t ram_kb = hdr[0x6B] | (hdr[0x6C] << 8);
     if (ram_kb == 0) ram_kb = 64;
-    if (ram_kb > 128) ram_kb = 128;
-
-    uint32_t banks_to_load = ram_kb / 16;
-    if (banks_to_load > RAM_BANKS) banks_to_load = RAM_BANKS;
-
-    long cur = ftell(f);
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, cur, SEEK_SET);
-
-    long need = 0x100 + (long)banks_to_load * (long)BANK_SIZE;
-    if (fsize < need) {
-        fprintf(stderr, "SNA: fichero truncado (tamaño=%ld, esperado>=%ld)", fsize, need);
-        fclose(f);
-        return false;
-    }
-
-    if (fseek(f, 0x100, SEEK_SET) != 0) {
-        fprintf(stderr, "SNA: error posicionando RAM");
-        fclose(f);
-        return false;
-    }
-
-    for (uint32_t b = 0; b < banks_to_load; b++) {
-        size_t rd = fread(ram[b], 1, BANK_SIZE, f);
-        if (rd != BANK_SIZE) {
-            fprintf(stderr, "SNA: error leyendo RAM bank %u", (unsigned)b);
-            fclose(f);
-            return false;
-        }
-    }
-
+    fseek(f, 0x100, SEEK_SET);
+    for (uint32_t b = 0; b < (ram_kb/16) && b < RAM_BANKS; b++) fread(ram[b], 1, BANK_SIZE, f);
     fclose(f);
 
-    // ── Estado extra v3 ───────────────────────────────────────────────────
-    if (version >= 3) {
-        ga_vsync_counter = hdr[0xB2] & 0x03;
-        ga_irq_counter   = hdr[0xB3] & 0x3F;
-        ga_irq_pending   = (hdr[0xB4] & 1) != 0;
-    } else {
-        ga_irq_counter = 0;
-        ga_irq_pending = false;
+    // Sincronización v3 (Timings de interrupción)
+    if (hdr[0x10] >= 3) {
+        ga_vsync_counter = hdr[0xB2] & 3;
+        ga_irq_counter = hdr[0xB3] & 0x3F;
+        ga_irq_pending = hdr[0xB4] & 1;
     }
-
+    
+    cpu_cycles = 0; audio_next_t = 0;
     update_vram_ptr();
-    memset(ga_mode_per_line, ga_mode, sizeof(ga_mode_per_line));
-
-    cpu_cycles   = 0;
-    audio_next_t = 0.0;
-
-    #undef LE16
-
-    printf("SNA cargado: v%u PC=0x%04X SP=0x%04X RAM=%uKB ROMsel=%u",
-           (unsigned)version, cpu.pc, cpu.sp, (unsigned)ram_kb, (unsigned)selected_upper_rom);
-
+    memset(ga_mode_per_line, ga_mode, GA_SCAN_LINES);
     return true;
 }
-
 
 bool cpc_load_dsk(const char* path) {
     return fdc_load_dsk(&fdc, 0, path);
