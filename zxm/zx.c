@@ -35,6 +35,8 @@ static uint8_t port_in(z80* z, uint16_t port) {
         for (int i = 0; i < 8; i++)
             if ((port & (1 << (i + 8))) == 0)
                 result &= keyboard_matrix[i];
+        // Bit 6 = EAR de entrada (cinta).  mic_bit se actualiza ciclo a ciclo
+        // en spectrum_run_frame() por tap_update() / tzx_update().
         if (mic_bit) result |=  0x40;
         else         result &= ~0x40;
         return result;
@@ -42,10 +44,9 @@ static uint8_t port_in(z80* z, uint16_t port) {
     return 0xFF;
 }
 
-// port_out ya no modifica border_color directamente; lo hace spectrum_run_frame
-// a través de ula_port_write, que además registra el cambio en la línea actual.
-// Sin embargo necesitamos la firma estándar para el core Z80.
-// Usamos una variable auxiliar que run_frame monitoriza.
+// port_out no actualiza border_color directamente; lo hace spectrum_run_frame
+// a través de la bandera ula_out_dirty, que permite registrar el cambio en la
+// línea ULA exacta en que ocurrió (necesario para efectos de borde por línea).
 static uint8_t ula_pending_out = 0;
 static bool    ula_out_dirty   = false;
 
@@ -78,6 +79,7 @@ int spectrum_load_tap(ZXSpectrum* s, const char* filename) {
     s->tap.active = false;
     s->tap.state  = TAP_STATE_IDLE;
     s->tap.ear    = 0;
+    s->tape_src   = TAPE_TAP;
     mic_bit       = 0;
     printf("[TAP] Fichero cargado: %s (%ld bytes)\n", filename, sz);
     return 0;
@@ -85,14 +87,16 @@ int spectrum_load_tap(ZXSpectrum* s, const char* filename) {
 
 static bool tap_next_block(TAPPlayer* t) {
     if (!t->data || t->pos + 2 > t->size) {
-        t->state = TAP_STATE_IDLE; t->active = false;
+        t->state  = TAP_STATE_IDLE;
+        t->active = false;
         printf("[TAP] Fin de cinta.\n");
         return false;
     }
     t->block_len = (uint32_t)t->data[t->pos] | ((uint32_t)t->data[t->pos + 1] << 8);
     t->pos += 2;
     if (t->pos + t->block_len > t->size) {
-        t->state = TAP_STATE_IDLE; t->active = false;
+        t->state  = TAP_STATE_IDLE;
+        t->active = false;
         printf("[TAP] Bloque truncado.\n");
         return false;
     }
@@ -117,20 +121,20 @@ static void tap_update(TAPPlayer* t, int cycles) {
         case TAP_STATE_PILOT:
             t->pilot_count--;
             if (t->pilot_count <= 0) {
-                t->state = TAP_STATE_SYNC1;
+                t->state         = TAP_STATE_SYNC1;
                 t->pulse_cycles += TAP_SYNC1_PULSE;
             } else {
                 t->pulse_cycles += TAP_PILOT_PULSE;
             }
             break;
         case TAP_STATE_SYNC1:
-            t->state = TAP_STATE_SYNC2;
+            t->state         = TAP_STATE_SYNC2;
             t->pulse_cycles += TAP_SYNC2_PULSE;
             break;
         case TAP_STATE_SYNC2:
-            t->state    = TAP_STATE_DATA;
-            t->byte_pos = 0;
-            t->bit_mask = 0x80;
+            t->state        = TAP_STATE_DATA;
+            t->byte_pos     = 0;
+            t->bit_mask     = 0x80;
             t->pulse_cycles += (t->data[t->pos + t->byte_pos] & t->bit_mask)
                                ? TAP_BIT1_PULSE : TAP_BIT0_PULSE;
             break;
@@ -143,8 +147,8 @@ static void tap_update(TAPPlayer* t, int cycles) {
                     t->bit_mask = 0x80;
                     t->byte_pos++;
                     if (t->byte_pos >= t->block_len) {
-                        t->pos += t->block_len;
-                        t->state = TAP_STATE_PAUSE;
+                        t->pos         += t->block_len;
+                        t->state        = TAP_STATE_PAUSE;
                         t->pulse_cycles += TAP_PAUSE_CYCLES;
                         break;
                     }
@@ -174,12 +178,45 @@ static void tap_start(TAPPlayer* t) {
 }
 
 // =============================================================================
+// Carga y arranque de TZX  (implementación delegada en tzx.c)
+// =============================================================================
+
+int spectrum_load_tzx(ZXSpectrum* s, const char* filename) {
+    // Desactivar cualquier fuente previa
+    s->tap.active = false;
+    tzx_free(&s->tzx);
+
+    if (tzx_load(&s->tzx, filename) != 0)
+        return -1;
+
+    s->tape_src = TAPE_TZX;
+    mic_bit     = 0;
+    return 0;
+}
+
+// Arranca la fuente de cinta activa (llamado con F1)
+void spectrum_tape_start(ZXSpectrum* s) {
+    switch (s->tape_src) {
+    case TAPE_TAP:
+        tap_start(&s->tap);
+        break;
+    case TAPE_TZX:
+        tzx_start(&s->tzx);
+        break;
+    default:
+        printf("[TAPE] No hay cinta cargada.\n");
+        break;
+    }
+}
+
+// =============================================================================
 // Inicialización y destrucción
 // =============================================================================
 
 void spectrum_init(ZXSpectrum* s) {
     memset(s, 0, sizeof(ZXSpectrum));
     for (int i = 0; i < 8; i++) keyboard_matrix[i] = 0xFF;
+    s->tape_src = TAPE_NONE;
 
     z80_init(&s->cpu);
     s->cpu.userdata   = s;
@@ -194,17 +231,14 @@ void spectrum_init(ZXSpectrum* s) {
         exit(1);
     }
 
-    // Ventana al tamaño del framebuffer completo ×2
     s->window   = SDL_CreateWindow("ZX Spectrum 48K Emulador",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    FULL_W * 2, FULL_H * 2,
                                    SDL_WINDOW_SHOWN);
     s->renderer = SDL_CreateRenderer(s->window, -1,
                                      SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    // Textura del tamaño completo (borde + imagen)
     s->texture  = SDL_CreateTexture(s->renderer, SDL_PIXELFORMAT_ARGB8888,
-                                    SDL_TEXTUREACCESS_STREAMING,
-                                    FULL_W, FULL_H);
+                                    SDL_TEXTUREACCESS_STREAMING, FULL_W, FULL_H);
     SDL_RenderSetLogicalSize(s->renderer, FULL_W * 2, FULL_H * 2);
 
     SDL_AudioSpec wanted, have;
@@ -220,6 +254,7 @@ void spectrum_init(ZXSpectrum* s) {
 void spectrum_destroy(ZXSpectrum* s) {
     free(s->tap.data);
     s->tap.data = NULL;
+    tzx_free(&s->tzx);
     SDL_DestroyTexture(s->texture);
     SDL_DestroyRenderer(s->renderer);
     SDL_DestroyWindow(s->window);
@@ -243,7 +278,7 @@ int spectrum_load_sna(ZXSpectrum* s, const char* filename) {
     FILE* f = fopen(filename, "rb");
     if (!f) return -1;
     uint8_t header[27];
-    if (fread(header, 1, 27, f) != 27) { fclose(f); return -1; }
+    if (fread(header, 1, 27, f) != 27)      { fclose(f); return -1; }
     if (fread(s->memory + 0x4000, 1, 49152, f) != 49152) { fclose(f); return -1; }
     fclose(f);
     s->cpu.i  = header[0];
@@ -316,9 +351,22 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
         case SDL_SCANCODE_M:      row=7; bit=2; break;
         case SDL_SCANCODE_N:      row=7; bit=3; break;
         case SDL_SCANCODE_B:      row=7; bit=4; break;
+
+        // F1 → iniciar/rebobinar cinta activa (TAP o TZX)
         case SDL_SCANCODE_F1:
-            if (pressed) tap_start(&s->tap);
+            if (pressed) spectrum_tape_start(s);
             return;
+
+        // F2 → detener cinta
+        case SDL_SCANCODE_F2:
+            if (pressed) {
+                s->tap.active = false;
+                s->tzx.active = false;
+                mic_bit = 0;
+                printf("[TAPE] Cinta detenida.\n");
+            }
+            return;
+
         default: break;
     }
     if (row != 255) {
@@ -328,31 +376,26 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
 }
 
 // =============================================================================
-// Bucle de frame con captura de borde por línea ULA
+// Bucle de frame
 // =============================================================================
 //
-// Geometría de timing del ULA 48K (valores canónicos):
+// Geometría del ULA 48K:
+//   Frame = 312 líneas × 224 T-states = 69 888 T-states/frame
 //
-//  Frame = 312 líneas × 224 T-states = 69888 T-states
-//
-//  Línea ULA 0  : primera línea del frame (invisible / retrazado vertical)
-//  Línea ULA 16 : inicio del borde superior visible
-//  Línea ULA 64 : inicio del área de imagen (papel)
-//  Línea ULA 255: última línea de imagen
-//  Línea ULA 256: inicio del borde inferior visible
-//  Línea ULA 303: última línea visible
-//  Líneas 304-311: retrazado vertical inferior (invisibles)
+//   ULA  0..15   → retrazado vertical superior (invisible)
+//   ULA 16..63   → borde superior visible  (48 líneas)
+//   ULA 64..255  → área de imagen           (192 líneas)
+//   ULA 256..303 → borde inferior visible   (48 líneas)
+//   ULA 304..311 → retrazado vertical inferior
 //
 // Dentro de cada línea (224 T-states):
-//   T  0.. 15 → borde izquierdo visible   (16 T/píxel-par → 16 píxeles border)
-//   T 16..143 → imagen (128 T-states, 2 T por píxel → 128 píxeles... ×2 = 256)
-//   T144..159 → borde derecho visible
-//   T160..223 → retrazado horizontal (invisible)
+//   T   0.. 15  → borde izquierdo visible
+//   T  16..143  → imagen (256 píxeles, 2T/píxel)
+//   T 144..159  → borde derecho visible
+//   T 160..223  → retrazado horizontal (invisible)
 //
-// Para capturar el color de borde con resolución de línea, simplemente
-// leemos border_color al inicio de cada línea ULA y lo guardamos en
-// s->border_lines[ula_line].  spectrum_render() lo consume después.
-//
+// border_lines[ula_line] se rellena en el punto exacto del frame en que el
+// Z80 escribe en el puerto 0xFE, lo que permite efectos de borde por línea.
 // =============================================================================
 
 void spectrum_run_frame(ZXSpectrum* s) {
@@ -361,13 +404,11 @@ void spectrum_run_frame(ZXSpectrum* s) {
 
     int cycles_done      = 0;
     int next_sample_at   = TSTATES_PER_SAMPLE;
-
-    // Línea ULA actual y T-state dentro de la línea
     int ula_line         = 0;
     int line_cycles_done = 0;
 
-    // Inicializar border_lines con el color actual (por si el programa no lo
-    // cambia durante el frame, todas las líneas tendrán el mismo color)
+    // Pre-rellenar border_lines con el color actual.  Se sobreescribirá línea
+    // a línea cuando el Z80 ejecute OUT (0xFE), <valor>.
     for (int i = 0; i < ULA_LINES_PER_FRAME; i++)
         s->border_lines[i] = border_color;
 
@@ -378,18 +419,17 @@ void spectrum_run_frame(ZXSpectrum* s) {
         cycles_done      += cycles;
         line_cycles_done += cycles;
 
-        // Procesar el OUT de la ULA si el Z80 escribió en el puerto 0xFE
+        // ── Procesar escritura en puerto ULA ─────────────────────────────
         if (ula_out_dirty) {
             border_color  = ula_pending_out & 0x07;
             ear_bit       = (ula_pending_out & 0x10) >> 4;
             ula_out_dirty = false;
-            // Actualizar la línea actual y todas las siguientes con el nuevo
-            // color (se sobreescribirán si cambia de nuevo en líneas posteriores)
+            // Propagar color al resto de líneas del frame desde la actual
             for (int i = ula_line; i < ULA_LINES_PER_FRAME; i++)
                 s->border_lines[i] = border_color;
         }
 
-        // Avanzar línea(s) ULA completa(s)
+        // ── Avanzar línea(s) ULA ─────────────────────────────────────────
         while (line_cycles_done >= ULA_TSTATES_PER_LINE) {
             line_cycles_done -= ULA_TSTATES_PER_LINE;
             ula_line++;
@@ -397,15 +437,26 @@ void spectrum_run_frame(ZXSpectrum* s) {
                 s->border_lines[ula_line] = border_color;
         }
 
-        // TAP
-        tap_update(&s->tap, cycles);
+        // ── Avanzar reproductor de cinta activo ──────────────────────────
+        switch (s->tape_src) {
+        case TAPE_TAP:
+            tap_update(&s->tap, cycles);
+            mic_bit = s->tap.ear;
+            break;
+        case TAPE_TZX:
+            tzx_update(&s->tzx, cycles);
+            mic_bit = s->tzx.ear;
+            break;
+        default:
+            break;
+        }
 
-        // Muestras de audio
+        // ── Muestreo de audio (beeper + cinta) ───────────────────────────
         while (cycles_done >= next_sample_at) {
             if (s->audio_pos < 882) {
                 float level = 0.0f;
-                if (ear_bit) level += 0.15f;
-                if (mic_bit) level += 0.15f;
+                if (ear_bit) level += 0.15f;   // beeper (OUT 0xFE bit 4)
+                if (mic_bit) level += 0.15f;   // cinta  (EAR de entrada)
                 if (level == 0.0f) level = -0.2f;
                 s->audio_buffer[s->audio_pos++] = level;
             }
@@ -421,55 +472,52 @@ void spectrum_run_frame(ZXSpectrum* s) {
 }
 
 // =============================================================================
-// Renderizado completo: borde por línea + imagen
+// Renderizado completo: borde por línea + imagen 256×192
 // =============================================================================
 //
-// El framebuffer (FULL_W × FULL_H = 352 × 288) se organiza así:
+// El framebuffer (FULL_W × FULL_H = 352 × 288) se estructura:
 //
-//   fila 0..47        → borde superior  (BORDER_TOP líneas)
-//   fila 48..239      → imagen + borde izq/dcha por cada línea
-//   fila 240..287     → borde inferior  (BORDER_BOTTOM líneas)
+//   fb_row  0.. 47  → borde superior  (48 px)
+//   fb_row 48..239  → imagen + borde izq/dcha
+//   fb_row 240..287 → borde inferior  (48 px)
 //
-// Para cada fila del framebuffer calculamos qué línea ULA le corresponde
-// y leemos s->border_lines[ula_line] para pintar el borde de esa fila.
-//
-// Mapeo fila framebuffer → línea ULA:
-//   fb_row 0   → ula_line ULA_FIRST_VISIBLE_LINE  (16)
-//   fb_row 47  → ula_line 63  (última línea borde superior)
-//   fb_row 48  → ula_line 64  (primera línea imagen)
-//   fb_row 239 → ula_line 255 (última línea imagen)
-//   fb_row 240 → ula_line 256 (primera línea borde inferior)
-//   fb_row 287 → ula_line 303
-//
+// Mapeo fb_row → línea ULA:
+//   fb_row + ULA_FIRST_VISIBLE_LINE (16)
+//   → fb_row=0  : ULA 16  (primera línea borde superior visible)
+//   → fb_row=47 : ULA 63  (última línea borde superior)
+//   → fb_row=48 : ULA 64  (primera línea de imagen)
+//   → fb_row=239: ULA 255 (última línea de imagen)
+//   → fb_row=240: ULA 256 (primera línea borde inferior)
+//   → fb_row=287: ULA 303 (última línea visible)
 // =============================================================================
 
 void spectrum_render(ZXSpectrum* s) {
     bool flash_phase = (s->frame_counter & 16) != 0;
 
     for (int fb_row = 0; fb_row < FULL_H; fb_row++) {
-        // Línea ULA que corresponde a este fb_row
-        int ula_line = ULA_FIRST_VISIBLE_LINE + fb_row;
+        int      ula_line  = ULA_FIRST_VISIBLE_LINE + fb_row;
         uint32_t border_px = palette[s->border_lines[ula_line] & 0x07];
+        uint32_t* dst      = &s->framebuffer[fb_row * FULL_W];
 
-        uint32_t* dst = &s->framebuffer[fb_row * FULL_W];
-
-        // ── Zona de imagen (filas 48..239) ────────────────────────────────
         if (fb_row >= BORDER_TOP && fb_row < BORDER_TOP + SCREEN_H) {
+            // ── Fila con imagen ───────────────────────────────────────────
             int img_row = fb_row - BORDER_TOP;  // 0..191
 
             // Borde izquierdo
             for (int x = 0; x < BORDER_LEFT; x++)
                 dst[x] = border_px;
 
-            // Imagen
-            int vram_y = (img_row & 0xC0) | ((img_row & 0x07) << 3) | ((img_row & 0x38) >> 3);
+            // Imagen: desentrelazado de la VRAM (orden de tercio/línea/carácter)
+            int vram_y = (img_row & 0xC0)
+                       | ((img_row & 0x07) << 3)
+                       | ((img_row & 0x38) >> 3);
             for (int col = 0; col < 32; col++) {
                 uint8_t pixels = s->memory[0x4000 + vram_y * 32 + col];
                 uint8_t attr   = s->memory[0x5800 + (img_row / 8) * 32 + col];
                 bool bright    = (attr & 0x40) != 0;
                 bool flash     = (attr & 0x80) != 0;
                 int ink   = (attr & 0x07) | (bright ? 8 : 0);
-                int paper = ((attr & 0x38) >> 3) | (bright ? 8 : 0);
+                int paper = ((attr >> 3) & 0x07) | (bright ? 8 : 0);
                 if (flash && flash_phase) { int t = ink; ink = paper; paper = t; }
                 for (int b = 0; b < 8; b++) {
                     bool is_ink = (pixels & (0x80 >> b)) != 0;
@@ -482,19 +530,34 @@ void spectrum_render(ZXSpectrum* s) {
                 dst[x] = border_px;
 
         } else {
-            // ── Borde superior o inferior: toda la fila con el color de borde ──
+            // ── Fila de borde puro (superior o inferior) ──────────────────
             for (int x = 0; x < FULL_W; x++)
                 dst[x] = border_px;
         }
     }
 
-    // Volcar el framebuffer a la textura SDL y presentar
     SDL_UpdateTexture(s->texture, NULL, s->framebuffer, FULL_W * sizeof(uint32_t));
     SDL_RenderClear(s->renderer);
-    // Escalar ×2 llenando la ventana
     SDL_Rect dst_rect = { 0, 0, FULL_W * 2, FULL_H * 2 };
     SDL_RenderCopy(s->renderer, s->texture, NULL, &dst_rect);
     SDL_RenderPresent(s->renderer);
+}
+
+// =============================================================================
+// Detección de extensión (case-insensitive, últimos 4 caracteres)
+// =============================================================================
+static bool ext_eq(const char* path, const char* ext) {
+    size_t plen = strlen(path);
+    size_t elen = strlen(ext);
+    if (plen < elen) return false;
+    const char* tail = path + plen - elen;
+    for (size_t i = 0; i < elen; i++) {
+        char a = tail[i], b = ext[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return false;
+    }
+    return true;
 }
 
 // =============================================================================
@@ -509,32 +572,38 @@ int main(int argc, char* argv[]) {
 
     if (argc > 1) {
         const char* file = argv[1];
-        size_t len = strlen(file);
-        if (len > 4 && (strcmp(file + len - 4, ".tap") == 0 ||
-                        strcmp(file + len - 4, ".TAP") == 0)) {
-            if (spectrum_load_tap(&spec, file) == 0) {
-                printf("TAP cargado: %s\n", file);
-                printf("Escribe LOAD \"\" en el Spectrum y pulsa F1 para iniciar la cinta.\n");
-            } else {
-                printf("Error leyendo TAP: %s\n", file);
-            }
-        } else if (len > 4 && (strcmp(file + len - 4, ".sna") == 0 ||
-                               strcmp(file + len - 4, ".SNA") == 0)) {
-            if (spectrum_load_sna(&spec, file) == 0)
-                printf("Snapshot cargado: %s\n", file);
+
+        if (ext_eq(file, ".tap")) {
+            if (spectrum_load_tap(&spec, file) == 0)
+                printf("TAP cargado. Escribe LOAD \"\" y pulsa F1 para iniciar.\n");
             else
-                printf("Error leyendo SNA: %s\n", file);
+                fprintf(stderr, "Error cargando TAP: %s\n", file);
+
+        } else if (ext_eq(file, ".tzx")) {
+            if (spectrum_load_tzx(&spec, file) == 0)
+                printf("TZX cargado. Escribe LOAD \"\" y pulsa F1 para iniciar.\n");
+            else
+                fprintf(stderr, "Error cargando TZX: %s\n", file);
+
+        } else if (ext_eq(file, ".sna")) {
+            if (spectrum_load_sna(&spec, file) == 0)
+                printf("Snapshot SNA cargado: %s\n", file);
+            else
+                fprintf(stderr, "Error cargando SNA: %s\n", file);
+
         } else {
-            printf("Formato no reconocido. Se admiten: .sna, .tap\n");
+            fprintf(stderr, "Formato no reconocido. Formatos admitidos: .sna  .tap  .tzx\n");
         }
     } else {
-        printf("Uso: %s [archivo.sna | archivo.tap]\n", argv[0]);
+        printf("Uso: %s <archivo.sna|archivo.tap|archivo.tzx>\n", argv[0]);
+        printf("  F1 → iniciar/rebobinar cinta\n");
+        printf("  F2 → detener cinta\n");
     }
 
-    uint32_t frame_ticks = 1000 / 50;
+    const uint32_t FRAME_MS = 1000 / 50;  // 20 ms por frame (50 Hz)
 
     while (!spec.quit) {
-        uint32_t start_time = SDL_GetTicks();
+        uint32_t t0 = SDL_GetTicks();
 
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -549,9 +618,9 @@ int main(int argc, char* argv[]) {
         spectrum_run_frame(&spec);
         spectrum_render(&spec);
 
-        uint32_t elapsed = SDL_GetTicks() - start_time;
-        if (elapsed < frame_ticks)
-            SDL_Delay(frame_ticks - elapsed);
+        uint32_t elapsed = SDL_GetTicks() - t0;
+        if (elapsed < FRAME_MS)
+            SDL_Delay(FRAME_MS - elapsed);
     }
 
     spectrum_destroy(&spec);

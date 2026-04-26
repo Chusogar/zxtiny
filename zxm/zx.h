@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <SDL2/SDL.h>
 #include "z80/jgz80/z80.h"
+#include "tzx.h"
 
 // ---------------------------------------------------------------------------
 // Temporización TAP (T-states a 3.5 MHz)
@@ -19,34 +20,21 @@
 #define TAP_PAUSE_CYCLES  3500000
 
 // ---------------------------------------------------------------------------
-// Temporización ULA / pantalla completa
+// Temporización ULA / pantalla completa (48K)
+//   Frame = 312 líneas × 224 T-states = 69 888 T-states
 //
-// El ULA del 48K genera un cuadro de 312 líneas × 224 T-states (a 3.5 MHz).
-// 69888 T-states/frame = 312 × 224.
-//
-// Distribución vertical (líneas de ULA):
-//   0..15   → borde superior invisible (retrazado)  [no se muestran]
-//  16..63   → borde superior visible  (48 líneas)
-//  64..255  → área de imagen          (192 líneas)
-// 256..311  → borde inferior visible  (56 líneas en real, aquí 48 para simetría)
-//
-// Por cada línea horizontal (224 T-states):
-//   0.. 15  → borde izquierdo (16 T-states = 2 bytes = 16 píxeles)
-//  16..143  → zona de imagen  (128 T-states = 16 bytes = 128 píxeles × 2)
-// 144..159  → borde derecho   (16 T-states)
-// 160..223  → retrazado horizontal (64 T-states, invisible)
-//
-// Para simplificar el buffer de borde usamos 1 muestra de color por línea ULA.
-// Eso da resolución suficiente para todos los efectos de borde conocidos.
+//   ULA  0..15   → retrazado vertical superior (invisible)
+//   ULA 16..63   → borde superior visible  (48 líneas)
+//   ULA 64..255  → área de imagen           (192 líneas)
+//   ULA 256..303 → borde inferior visible   (48 líneas)
+//   ULA 304..311 → retrazado vertical inferior
 // ---------------------------------------------------------------------------
 #define ULA_TSTATES_PER_LINE    224
 #define ULA_LINES_PER_FRAME     312
-#define ULA_FIRST_PAPER_LINE     64   // Primera línea ULA con imagen
-#define ULA_FIRST_VISIBLE_LINE   16   // Primera línea visible (borde sup)
-#define ULA_LAST_VISIBLE_LINE   303   // Última línea visible  (borde inf)
+#define ULA_FIRST_PAPER_LINE     64
+#define ULA_FIRST_VISIBLE_LINE   16
+#define ULA_LAST_VISIBLE_LINE   303
 
-// Dimensiones del framebuffer completo (borde + imagen)
-// Borde: 48 px arriba, 48 abajo, 48 izquierda, 48 derecha
 #define BORDER_LEFT    48
 #define BORDER_RIGHT   48
 #define BORDER_TOP     48
@@ -56,9 +44,7 @@
 #define FULL_W        (BORDER_LEFT + SCREEN_W + BORDER_RIGHT)   // 352
 #define FULL_H        (BORDER_TOP  + SCREEN_H + BORDER_BOTTOM)  // 288
 
-// Número de líneas ULA visibles que forman el borde vertical
-#define ULA_BORDER_TOP_LINES   48   // líneas ULA 16..63
-#define ULA_BORDER_BOT_LINES   48   // líneas ULA 256..303
+#define BORDER_LINE_BUF  ULA_LINES_PER_FRAME
 
 // ---------------------------------------------------------------------------
 // Máquina de estados TAP
@@ -87,12 +73,13 @@ typedef struct {
 } TAPPlayer;
 
 // ---------------------------------------------------------------------------
-// Buffer de borde por línea ULA
-// Almacena el color de borde (0-7) activo al principio de cada una de las
-// ULA_LINES_PER_FRAME líneas. spectrum_run_frame() lo rellena; spectrum_render()
-// lo consume para pintar el borde con resolución de línea.
+// Selector de fuente de cinta activa
 // ---------------------------------------------------------------------------
-#define BORDER_LINE_BUF  ULA_LINES_PER_FRAME
+typedef enum {
+    TAPE_NONE = 0,
+    TAPE_TAP,
+    TAPE_TZX
+} TapeSource;
 
 // ---------------------------------------------------------------------------
 // Estructura principal del emulador
@@ -104,19 +91,21 @@ typedef struct {
     // Gráficos SDL
     SDL_Window*   window;
     SDL_Renderer* renderer;
-    SDL_Texture*  texture;          // Framebuffer completo FULL_W × FULL_H
+    SDL_Texture*  texture;
     uint32_t framebuffer[FULL_W * FULL_H];
 
     // Borde por línea ULA
-    uint8_t border_lines[BORDER_LINE_BUF]; // color de borde por línea ULA
+    uint8_t border_lines[BORDER_LINE_BUF];
 
     // Audio SDL
     SDL_AudioDeviceID audio_dev;
     float audio_buffer[882];
     int   audio_pos;
 
-    // TAP
-    TAPPlayer tap;
+    // Reproductores de cinta
+    TAPPlayer  tap;
+    TZXPlayer  tzx;
+    TapeSource tape_src;   // Fuente activa (TAP o TZX)
 
     bool quit;
     int  frame_counter;
@@ -133,6 +122,8 @@ void spectrum_init(ZXSpectrum* spec);
 int  spectrum_load_rom(ZXSpectrum* spec, const char* filename);
 int  spectrum_load_sna(ZXSpectrum* spec, const char* filename);
 int  spectrum_load_tap(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_tzx(ZXSpectrum* spec, const char* filename);
+void spectrum_tape_start(ZXSpectrum* spec);
 void spectrum_handle_key(ZXSpectrum* spec, SDL_Scancode key, bool pressed);
 void spectrum_run_frame(ZXSpectrum* spec);
 void spectrum_render(ZXSpectrum* spec);
