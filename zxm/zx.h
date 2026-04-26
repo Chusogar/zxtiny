@@ -4,50 +4,95 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SDL2/SDL.h>
-#include "z80/jgz80/z80.h" // Core Z80 de jgz80 (o superzazu)
+#include "z80/jgz80/z80.h"
 
 // ---------------------------------------------------------------------------
-// Temporización TAP (en ciclos de T-states a 3.5 MHz)
+// Temporización TAP (T-states a 3.5 MHz)
 // ---------------------------------------------------------------------------
-#define TAP_PILOT_PULSE     2168   // Duración de cada pulso del tono piloto
-#define TAP_PILOT_HEADER    8063   // Nº de pulsos piloto para cabecera (bloque tipo 0)
-#define TAP_PILOT_DATA      3223   // Nº de pulsos piloto para datos   (bloque tipo != 0)
-#define TAP_SYNC1_PULSE      667   // Primer pulso de sincronismo
-#define TAP_SYNC2_PULSE      735   // Segundo pulso de sincronismo
-#define TAP_BIT0_PULSE       855   // Duración de cada mitad del pulso "0"
-#define TAP_BIT1_PULSE      1710   // Duración de cada mitad del pulso "1"
-#define TAP_PAUSE_CYCLES  3500000  // Pausa entre bloques (~1 s a 3.5 MHz)
+#define TAP_PILOT_PULSE     2168
+#define TAP_PILOT_HEADER    8063
+#define TAP_PILOT_DATA      3223
+#define TAP_SYNC1_PULSE      667
+#define TAP_SYNC2_PULSE      735
+#define TAP_BIT0_PULSE       855
+#define TAP_BIT1_PULSE      1710
+#define TAP_PAUSE_CYCLES  3500000
 
 // ---------------------------------------------------------------------------
-// Máquina de estados del reproductor de pulsos TAP
+// Temporización ULA / pantalla completa
+//
+// El ULA del 48K genera un cuadro de 312 líneas × 224 T-states (a 3.5 MHz).
+// 69888 T-states/frame = 312 × 224.
+//
+// Distribución vertical (líneas de ULA):
+//   0..15   → borde superior invisible (retrazado)  [no se muestran]
+//  16..63   → borde superior visible  (48 líneas)
+//  64..255  → área de imagen          (192 líneas)
+// 256..311  → borde inferior visible  (56 líneas en real, aquí 48 para simetría)
+//
+// Por cada línea horizontal (224 T-states):
+//   0.. 15  → borde izquierdo (16 T-states = 2 bytes = 16 píxeles)
+//  16..143  → zona de imagen  (128 T-states = 16 bytes = 128 píxeles × 2)
+// 144..159  → borde derecho   (16 T-states)
+// 160..223  → retrazado horizontal (64 T-states, invisible)
+//
+// Para simplificar el buffer de borde usamos 1 muestra de color por línea ULA.
+// Eso da resolución suficiente para todos los efectos de borde conocidos.
+// ---------------------------------------------------------------------------
+#define ULA_TSTATES_PER_LINE    224
+#define ULA_LINES_PER_FRAME     312
+#define ULA_FIRST_PAPER_LINE     64   // Primera línea ULA con imagen
+#define ULA_FIRST_VISIBLE_LINE   16   // Primera línea visible (borde sup)
+#define ULA_LAST_VISIBLE_LINE   303   // Última línea visible  (borde inf)
+
+// Dimensiones del framebuffer completo (borde + imagen)
+// Borde: 48 px arriba, 48 abajo, 48 izquierda, 48 derecha
+#define BORDER_LEFT    48
+#define BORDER_RIGHT   48
+#define BORDER_TOP     48
+#define BORDER_BOTTOM  48
+#define SCREEN_W      256
+#define SCREEN_H      192
+#define FULL_W        (BORDER_LEFT + SCREEN_W + BORDER_RIGHT)   // 352
+#define FULL_H        (BORDER_TOP  + SCREEN_H + BORDER_BOTTOM)  // 288
+
+// Número de líneas ULA visibles que forman el borde vertical
+#define ULA_BORDER_TOP_LINES   48   // líneas ULA 16..63
+#define ULA_BORDER_BOT_LINES   48   // líneas ULA 256..303
+
+// ---------------------------------------------------------------------------
+// Máquina de estados TAP
 // ---------------------------------------------------------------------------
 typedef enum {
-    TAP_STATE_IDLE = 0,   // Sin cinta / cinta parada
-    TAP_STATE_PILOT,      // Emitiendo tono piloto
-    TAP_STATE_SYNC1,      // Primer pulso de sync
-    TAP_STATE_SYNC2,      // Segundo pulso de sincronismo
-    TAP_STATE_DATA,       // Emitiendo bits de datos
-    TAP_STATE_PAUSE       // Pausa entre bloques
+    TAP_STATE_IDLE = 0,
+    TAP_STATE_PILOT,
+    TAP_STATE_SYNC1,
+    TAP_STATE_SYNC2,
+    TAP_STATE_DATA,
+    TAP_STATE_PAUSE
 } TAPState;
 
 typedef struct {
-    // Datos crudos del fichero TAP en memoria
     uint8_t* data;
     uint32_t size;
-
-    // Posición actual dentro del buffer TAP
-    uint32_t pos;           // Apunta al inicio del bloque TAP actual
-    uint32_t block_len;     // Longitud del bloque actual (bytes de datos)
-    uint32_t byte_pos;      // Byte actual dentro del bloque
-    uint8_t  bit_mask;      // Máscara del bit actual (0x80..0x01)
-
-    // Máquina de estados
+    uint32_t pos;
+    uint32_t block_len;
+    uint32_t byte_pos;
+    uint8_t  bit_mask;
     TAPState state;
-    int      pilot_count;   // Pulsos piloto restantes
-    int32_t  pulse_cycles;  // T-states que quedan en el pulso actual
-    uint8_t  ear;           // Nivel actual del pin EAR (0 ó 1)
-    bool     active;        // true = hay cinta reproduciendo
+    int      pilot_count;
+    int32_t  pulse_cycles;
+    uint8_t  ear;
+    bool     active;
 } TAPPlayer;
+
+// ---------------------------------------------------------------------------
+// Buffer de borde por línea ULA
+// Almacena el color de borde (0-7) activo al principio de cada una de las
+// ULA_LINES_PER_FRAME líneas. spectrum_run_frame() lo rellena; spectrum_render()
+// lo consume para pintar el borde con resolución de línea.
+// ---------------------------------------------------------------------------
+#define BORDER_LINE_BUF  ULA_LINES_PER_FRAME
 
 // ---------------------------------------------------------------------------
 // Estructura principal del emulador
@@ -56,33 +101,34 @@ typedef struct {
     z80 cpu;
     uint8_t memory[65536];
 
-    // Gráficos (SDL)
+    // Gráficos SDL
     SDL_Window*   window;
     SDL_Renderer* renderer;
-    SDL_Texture*  texture;
-    uint32_t screen_buffer[256 * 192];
+    SDL_Texture*  texture;          // Framebuffer completo FULL_W × FULL_H
+    uint32_t framebuffer[FULL_W * FULL_H];
 
-    // Audio (SDL)
+    // Borde por línea ULA
+    uint8_t border_lines[BORDER_LINE_BUF]; // color de borde por línea ULA
+
+    // Audio SDL
     SDL_AudioDeviceID audio_dev;
-    float audio_buffer[882];   // 44100 Hz / 50 FPS = 882 muestras/frame
+    float audio_buffer[882];
     int   audio_pos;
 
-    // Reproductor TAP
+    // TAP
     TAPPlayer tap;
 
     bool quit;
     int  frame_counter;
 } ZXSpectrum;
 
-// Variables globales de la ULA (accedidas desde callbacks de I/O)
+// Variables globales ULA
 uint8_t border_color;
 uint8_t keyboard_matrix[8];
-uint8_t ear_bit;   // EAR de SALIDA (beeper, escritura por el Z80)
-uint8_t mic_bit;   // MIC/EAR de ENTRADA (cinta, leído por el Z80)
+uint8_t ear_bit;
+uint8_t mic_bit;
 
-// ---------------------------------------------------------------------------
 // Prototipos
-// ---------------------------------------------------------------------------
 void spectrum_init(ZXSpectrum* spec);
 int  spectrum_load_rom(ZXSpectrum* spec, const char* filename);
 int  spectrum_load_sna(ZXSpectrum* spec, const char* filename);
