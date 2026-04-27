@@ -87,7 +87,7 @@ typedef struct {
     SDL_Window* window;
     SDL_Renderer* renderer;
     SDL_Texture* texture;
-    uint32_t screen_buffer[800 * 300];
+    uint32_t screen_buffer[768 * 544];
 
     // -----------------------------
     // SDL audio (cola) + sincronía
