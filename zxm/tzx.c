@@ -341,6 +341,7 @@ static void tzx_start_block(TZXPlayer* t) {
         t->dc.byte_pos     = 0;
         t->dc.bit_mask     = 0x80;
         t->dc.bits_left    = 8;
+        t->dc.half_pulse   = 0;
 
         t->pulse_state  = TZX_PS_PILOT;
         t->pulse_cycles = t->dc.pilot_pulse;
@@ -366,6 +367,7 @@ static void tzx_start_block(TZXPlayer* t) {
         t->dc.byte_pos    = 0;
         t->dc.bit_mask    = 0x80;
         t->dc.bits_left   = (data_len <= 1) ? t->dc.last_byte_bits : 8;
+        t->dc.half_pulse  = 0;
 
         t->pulse_state  = TZX_PS_PILOT;
         t->pulse_cycles = t->dc.pilot_pulse;
@@ -423,6 +425,7 @@ static void tzx_start_block(TZXPlayer* t) {
         t->dc.byte_pos     = 0;
         t->dc.bit_mask     = 0x80;
         t->dc.bits_left    = (data_len <= 1) ? t->dc.last_byte_bits : 8;
+        t->dc.half_pulse   = 0;
 
         // Empezar directamente en DATA (sin pilot/sync)
         t->pulse_state = TZX_PS_PURE_DATA;
@@ -680,9 +683,8 @@ static void tzx_next_pulse(TZXPlayer* t) {
     // ── Datos (0x10, 0x11) ──────────────────────────────────────────────────
     case TZX_PS_DATA: {
         ear_toggle(t);
-        // Hemos terminado un semi-pulso.  Si ear vuelve a 0 hemos completado
-        // los dos semi-pulsos del bit → avanzar al siguiente bit.
-        if (t->ear == 0) {
+        t->dc.half_pulse ^= 1;
+        if (t->dc.half_pulse == 0) {
             t->dc.bit_mask >>= 1;
             t->dc.bits_left--;
             if (t->dc.bits_left == 0) {
@@ -743,7 +745,8 @@ static void tzx_next_pulse(TZXPlayer* t) {
     // ── Pure Data (0x14) ────────────────────────────────────────────────────
     case TZX_PS_PURE_DATA: {
         ear_toggle(t);
-        if (t->ear == 0) {
+        t->dc.half_pulse ^= 1;
+        if (t->dc.half_pulse == 0) {
             // Segundo semi-pulso terminado → avanzar bit
             t->dc.bit_mask >>= 1;
             t->dc.bits_left--;
