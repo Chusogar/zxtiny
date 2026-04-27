@@ -669,7 +669,8 @@ void tzx_update(TZXPlayer* t, int cycles) {
             if (t->datacodes) {
                 int nc = t->datacodes;
                 tzx_tzx19(t, nc, t->dataitems);
-                t->bits = nc <= 2 ? 1 : nc <= 4 ? 2 : nc <= 16 ? 4 : 8;
+                // ceil(log2(nc)): bits exactos por símbolo
+                { int b = 0, v = nc - 1; while (v > 0) { b++; v >>= 1; } t->bits = b ? b : 1; }
                 t->mask = (1 << t->bits) - 1;
                 t->feedable = t->bits == 1
                     && !t->codeitem[0][0] && !t->codeitem[1][0]
@@ -682,7 +683,19 @@ void tzx_update(TZXPlayer* t, int cycles) {
                 t->time_count = 8;
             }
             if (!t->item) { // inicio del símbolo
-                t->code = t->codeitem[(t->byte_val >> (t->time_count - t->bits)) & t->mask];
+                int sym;
+                if (t->time_count >= t->bits) {
+                    sym = (t->byte_val >> (t->time_count - t->bits)) & t->mask;
+                } else {
+                    // Símbolo a caballo entre dos bytes
+                    int have = t->time_count;
+                    int need = t->bits - have;
+                    sym = (t->byte_val & ((1 << have) - 1)) << need;
+                    t->byte_val   = tzx_getc(t);
+                    t->time_count = 8 + have; // tras -= bits quedará 8 - need
+                    sym |= (t->byte_val >> (8 - need)) & ((1 << need) - 1);
+                }
+                t->code = t->codeitem[sym];
                 tzx_firstbit(t, *t->code);
             }
             {
