@@ -133,6 +133,7 @@ typedef struct {
     TapeSource tape_src;
 
     bool quit;
+    bool turbo_mode;
     int  frame_counter;
 } ZXSpectrum;
 

@@ -530,6 +530,12 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
             return;
         case SDL_SCANCODE_F2:
             if (pressed) {
+                s->turbo_mode = !s->turbo_mode;
+                printf("[EMU] Velocidad %s\n", s->turbo_mode ? "MAXIMA" : "normal");
+            }
+            return;
+        case SDL_SCANCODE_F3:
+            if (pressed) {
                 s->tap.active = false;
                 s->tzx.active = false;
                 s->mic_bit = 0;
@@ -681,7 +687,8 @@ int main(int argc, char* argv[]) {
     } else {
         printf("Uso: %s <archivo.sna|archivo.tap|archivo.tzx>\n", argv[0]);
         printf("  F1 -> iniciar/rebobinar cinta\n");
-        printf("  F2 -> detener cinta\n");
+        printf("  F2 -> velocidad maxima / normal\n");
+        printf("  F3 -> detener cinta\n");
     }
 
     const uint32_t FRAME_MS = 1000 / 50;
@@ -700,11 +707,16 @@ int main(int argc, char* argv[]) {
         }
 
         spectrum_run_frame(&spec);
-        spectrum_render(&spec);
 
-        uint32_t elapsed = SDL_GetTicks() - t0;
-        if (elapsed < FRAME_MS)
-            SDL_Delay(FRAME_MS - elapsed);
+        if (spec.turbo_mode) {
+            if ((spec.frame_counter & 7) == 0)
+                spectrum_render(&spec);
+        } else {
+            spectrum_render(&spec);
+            uint32_t elapsed = SDL_GetTicks() - t0;
+            if (elapsed < FRAME_MS)
+                SDL_Delay(FRAME_MS - elapsed);
+        }
     }
 
     spectrum_destroy(&spec);
