@@ -89,6 +89,9 @@ typedef struct {
     uint8_t  last_byte_bits;  // Bits usados en el último byte (1-8)
     uint32_t pause_ms;        // Pausa al final del bloque (ms)
 
+    // Seguimiento de semi-pulsos dentro de cada bit
+    uint8_t  half_pulse;      // 0 = primer semi-pulso, 1 = segundo semi-pulso
+
     // Posición dentro de los datos del bloque
     uint32_t data_offset;     // Offset en tzx_data donde empiezan los bytes
     uint32_t data_len;        // Longitud en bytes del bloque de datos
