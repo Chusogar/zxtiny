@@ -16,6 +16,7 @@
 //  0x13  Pulse Sequence               (hasta 255 pulsos de duración variable)
 //  0x14  Pure Data                    (solo datos, sin pilot/sync)
 //  0x15  Direct Recording             (muestras de 1 bit a frecuencia dada)
+//  0x19  Generalized Data             (piloto+datos con alfabeto de símbolos)
 //  0x20  Pause / Stop the Tape        (pausa en ms; 0 ms = stop)
 //  0x21  Group Start                  (ignorado, solo metadato)
 //  0x22  Group End                    (ignorado)
@@ -69,6 +70,7 @@ typedef enum {
     TZX_PS_PULSE_SEQ,     // Bloque 0x13: secuencia de pulsos
     TZX_PS_PURE_DATA,     // Bloque 0x14: datos sin pilot
     TZX_PS_DIRECT,        // Bloque 0x15: grabación directa
+    TZX_PS_GDB,           // Bloque 0x19: Generalized Data
     TZX_PS_PAUSE,         // Pausa entre bloques
 } TZXPulseState;
 
@@ -103,6 +105,44 @@ typedef struct {
     int      count;                  // Total de pulsos en la secuencia
     int      index;                  // Índice del pulso actual
 } TZXPulseSeq;
+
+// ---------------------------------------------------------------------------
+// Contexto de Generalized Data Block (0x19)
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint32_t pause_ms;
+
+    // Pilot/sync table parameters
+    uint32_t totp;              // Total pilot/sync symbols (PRLE entries expand to this)
+    uint8_t  npp;               // Max pulses per pilot symbol
+    uint16_t asp;               // Pilot alphabet size (0→256 already resolved)
+    uint32_t pilot_sym_off;     // Offset in data[] to pilot SYMDEF table
+    uint32_t pilot_prle_off;    // Offset in data[] to pilot PRLE entries
+
+    // Data table parameters
+    uint32_t totd;              // Total data symbols
+    uint8_t  npd;               // Max pulses per data symbol
+    uint16_t asd;               // Data alphabet size (0→256 already resolved)
+    uint32_t data_sym_off;      // Offset in data[] to data SYMDEF table
+    uint32_t data_stream_off;   // Offset in data[] to data stream
+    uint8_t  bits_per_sym;      // ceil(log2(ASD)), 0 if ASD<=1
+
+    // Playback phase: 0=pilot, 1=data
+    uint8_t  phase;
+
+    // Pilot state
+    uint32_t prle_idx;          // Current PRLE run index
+    uint16_t cur_reps;          // Total repetitions for current run
+    uint32_t sym_rep;           // Repetitions done in current run
+
+    // Data state
+    uint32_t data_sym_done;     // Data symbols fully output
+    uint32_t data_bit_pos;      // Bit position in the data stream
+
+    // Current symbol being output
+    uint8_t  cur_sym;           // Symbol index in the alphabet
+    uint8_t  pulse_idx;         // Current pulse within symbol
+} TZXGDBCtx;
 
 // ---------------------------------------------------------------------------
 // Contexto de Direct Recording (0x15)
@@ -142,6 +182,7 @@ typedef struct {
     TZXDataCtx  dc;          // Datos variables del bloque de datos actual
     TZXPulseSeq ps;          // Secuencia de pulsos (0x12 / 0x13)
     TZXDirectCtx dr;         // Grabación directa (0x15)
+    TZXGDBCtx   gdb;         // Generalized Data (0x19)
 
     // Pausa activa (bloque 0x20 o fin de bloque)
     uint32_t pause_cycles;   // T-states restantes de la pausa

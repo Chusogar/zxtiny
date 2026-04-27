@@ -57,6 +57,7 @@ const char* tzx_block_name(uint8_t id) {
     case 0x13: return "Pulse Sequence";
     case 0x14: return "Pure Data";
     case 0x15: return "Direct Recording";
+    case 0x19: return "Generalized Data";
     case 0x20: return "Pause / Stop";
     case 0x21: return "Group Start";
     case 0x22: return "Group End";
@@ -78,6 +79,51 @@ const char* tzx_block_name(uint8_t id) {
 // Avance al bloque EAR (toggle del nivel)
 // ---------------------------------------------------------------------------
 static inline void ear_toggle(TZXPlayer* t) { t->ear ^= 1; }
+
+// ---------------------------------------------------------------------------
+// Helpers para Generalized Data Block (0x19)
+// ---------------------------------------------------------------------------
+
+// Lee bits_per_sym bits del data stream y devuelve el índice de símbolo
+static uint8_t gdb_read_data_symbol(TZXPlayer* t, TZXGDBCtx* g) {
+    if (g->bits_per_sym == 0) return 0;
+    uint8_t sym = 0;
+    for (int i = 0; i < g->bits_per_sym; i++) {
+        uint32_t ab  = g->data_bit_pos++;
+        uint32_t bi  = ab / 8;
+        uint8_t  sh  = 7 - (ab % 8);
+        sym = (uint8_t)((sym << 1) | ((t->data[g->data_stream_off + bi] >> sh) & 1));
+    }
+    return sym;
+}
+
+// Offset en data[] de la SYMDEF de un símbolo
+static inline uint32_t gdb_symdef_off(TZXGDBCtx* g, uint8_t sym_idx) {
+    uint32_t base = (g->phase == 0) ? g->pilot_sym_off  : g->data_sym_off;
+    uint8_t  maxp = (g->phase == 0) ? g->npp            : g->npd;
+    return base + (uint32_t)sym_idx * (1 + 2 * maxp);
+}
+
+// Duración del pulso actual del símbolo actual
+static inline uint16_t gdb_cur_pulse_len(TZXPlayer* t, TZXGDBCtx* g) {
+    return rd16(t->data + gdb_symdef_off(g, g->cur_sym) + 1 + g->pulse_idx * 2);
+}
+
+// Aplica la polaridad de edge para el pulso actual del símbolo.
+// Solo el primer pulso (pulse_idx==0) usa el edge type; los demás hacen toggle.
+static void gdb_apply_edge(TZXPlayer* t, TZXGDBCtx* g) {
+    if (g->pulse_idx == 0) {
+        uint8_t edge = t->data[gdb_symdef_off(g, g->cur_sym)] & 0x03;
+        switch (edge) {
+        case 0:  ear_toggle(t); break;   // opposite (normal edge)
+        case 1:  break;                  // same level (no edge)
+        case 2:  t->ear = 0; break;      // force low
+        case 3:  t->ear = 1; break;      // force high
+        }
+    } else {
+        ear_toggle(t);
+    }
+}
 
 // =============================================================================
 // Construcción de la tabla de bloques
@@ -110,6 +156,9 @@ static uint32_t tzx_block_body_size(const uint8_t* data, uint32_t size, uint32_t
     case 0x15:  // Direct Recording: 8 cabecera + data
         if (rem < 8) return 0;
         return 8 + rd24(p + 5);
+    case 0x19:  // Generalized Data: 4 len + body
+        if (rem < 4) return 0;
+        return 4 + rd32(p);
     case 0x20:  // Pause: 2 bytes
         return 2;
     case 0x21:  // Group Start: 1 len + N chars
@@ -156,10 +205,10 @@ static int tzx_index_blocks(TZXPlayer* t) {
     uint32_t off = 10;  // Cabecera TZX = 10 bytes
     while (off < t->size) {
         uint32_t body = tzx_block_body_size(t->data, t->size, off);
-        if (body == 0 && off < t->size) {
+        //if (body == 0 && off < t->size) {
             // Bloque desconocido irrecuperable: parar indexado
-            break;
-        }
+        //    break;
+        //}
         count++;
         off += 1 + body;
     }
@@ -316,7 +365,7 @@ static void tzx_start_block(TZXPlayer* t) {
         t->dc.data_len    = data_len;
         t->dc.byte_pos    = 0;
         t->dc.bit_mask    = 0x80;
-        t->dc.bits_left   = t->dc.last_byte_bits;
+        t->dc.bits_left   = (data_len <= 1) ? t->dc.last_byte_bits : 8;
 
         t->pulse_state  = TZX_PS_PILOT;
         t->pulse_cycles = t->dc.pilot_pulse;
@@ -373,7 +422,7 @@ static void tzx_start_block(TZXPlayer* t) {
         t->dc.data_len     = data_len;
         t->dc.byte_pos     = 0;
         t->dc.bit_mask     = 0x80;
-        t->dc.bits_left    = t->dc.last_byte_bits;
+        t->dc.bits_left    = (data_len <= 1) ? t->dc.last_byte_bits : 8;
 
         // Empezar directamente en DATA (sin pilot/sync)
         t->pulse_state = TZX_PS_PURE_DATA;
@@ -409,6 +458,84 @@ static void tzx_start_block(TZXPlayer* t) {
             uint8_t byte0 = (data_len > 0) ? t->data[t->dr.data_offset] : 0;
             t->ear = (byte0 & 0x80) ? 1 : 0;
         }
+        break;
+    }
+
+    // ── 0x19  Generalized Data ───────────────────────────────────────────────
+    case 0x19: {
+        // p apunta al primer byte tras el ID (o sea, al DWORD block_length)
+        // Cabecera fija: 4 block_len + 2 pause + 4 TOTP + 1 NPP + 1 ASP
+        //              + 4 TOTD + 1 NPD + 1 ASD = 18 bytes
+        if (rd32(p) < 14) { tzx_next_block(t); return; }
+
+        TZXGDBCtx *g = &t->gdb;
+        g->pause_ms = rd16(p + 4);
+        g->totp     = rd32(p + 6);
+        g->npp      = p[10];
+        g->asp      = p[11] ? p[11] : 256;
+        g->totd     = rd32(p + 12);
+        g->npd      = p[16];
+        g->asd      = p[17] ? p[17] : 256;
+
+        // ceil(log2(ASD))
+        {
+            uint16_t n = g->asd;
+            uint8_t b = 0;
+            if (n > 1) { n--; while (n) { b++; n >>= 1; } }
+            g->bits_per_sym = b;
+        }
+
+        // Calcular offsets a las secciones del bloque
+        uint32_t cur = off + 1 + 18; // tras ID + 18 bytes de cabecera
+        if (g->totp > 0) {
+            g->pilot_sym_off  = cur;
+            cur += (uint32_t)g->asp * (1 + 2 * g->npp);
+            g->pilot_prle_off = cur;
+            cur += g->totp * 3;
+        } else {
+            g->pilot_sym_off  = 0;
+            g->pilot_prle_off = 0;
+        }
+        if (g->totd > 0) {
+            g->data_sym_off    = cur;
+            cur += (uint32_t)g->asd * (1 + 2 * g->npd);
+            g->data_stream_off = cur;
+        } else {
+            g->data_sym_off    = 0;
+            g->data_stream_off = 0;
+        }
+
+        // Iniciar la reproducción
+        g->pulse_idx     = 0;
+        g->prle_idx      = 0;
+        g->sym_rep       = 0;
+        g->data_sym_done = 0;
+        g->data_bit_pos  = 0;
+
+        if (g->totp > 0) {
+            g->phase    = 0; // piloto
+            g->cur_sym  = t->data[g->pilot_prle_off];
+            g->cur_reps = rd16(t->data + g->pilot_prle_off + 1);
+        } else if (g->totd > 0) {
+            g->phase = 1; // datos
+            // Leer primer símbolo del data stream
+            g->cur_sym = gdb_read_data_symbol(t, g);
+        } else {
+            // Ni piloto ni datos → solo pausa
+            if (g->pause_ms > 0) {
+                t->pulse_state   = TZX_PS_PAUSE;
+                t->pulse_cycles  = (int32_t)TZX_MS_TO_TSTATES(g->pause_ms);
+                t->ear           = 0;
+            } else {
+                tzx_next_block(t);
+            }
+            return;
+        }
+
+        // Emitir el primer pulso del primer símbolo
+        t->pulse_state = TZX_PS_GDB;
+        gdb_apply_edge(t, g);
+        t->pulse_cycles = gdb_cur_pulse_len(t, g);
         break;
     }
 
@@ -557,15 +684,16 @@ static void tzx_next_pulse(TZXPlayer* t) {
         // los dos semi-pulsos del bit → avanzar al siguiente bit.
         if (t->ear == 0) {
             t->dc.bit_mask >>= 1;
-            if (t->dc.bit_mask == 0) {
-                // Byte completo
+            t->dc.bits_left--;
+            if (t->dc.bits_left == 0) {
+                // Todos los bits válidos de este byte procesados
                 t->dc.byte_pos++;
                 t->dc.bit_mask = 0x80;
                 if (t->dc.byte_pos >= t->dc.data_len) {
                     // Fin de bloque → pausa
                     goto end_of_data;
                 }
-                // Ajustar bits válidos para el último byte
+                // Ajustar bits válidos para el siguiente byte
                 t->dc.bits_left = (t->dc.byte_pos == t->dc.data_len - 1)
                                    ? t->dc.last_byte_bits : 8;
             }
@@ -618,7 +746,8 @@ static void tzx_next_pulse(TZXPlayer* t) {
         if (t->ear == 0) {
             // Segundo semi-pulso terminado → avanzar bit
             t->dc.bit_mask >>= 1;
-            if (t->dc.bit_mask == 0) {
+            t->dc.bits_left--;
+            if (t->dc.bits_left == 0) {
                 t->dc.byte_pos++;
                 t->dc.bit_mask = 0x80;
                 if (t->dc.byte_pos >= t->dc.data_len) {
@@ -631,6 +760,8 @@ static void tzx_next_pulse(TZXPlayer* t) {
                     }
                     break;
                 }
+                t->dc.bits_left = (t->dc.byte_pos == t->dc.data_len - 1)
+                                   ? t->dc.last_byte_bits : 8;
             }
         }
         {
@@ -660,6 +791,79 @@ static void tzx_next_pulse(TZXPlayer* t) {
         uint8_t  byte     = t->data[t->dr.data_offset + byte_idx];
         t->ear            = (byte >> bit_idx) & 1;
         t->pulse_cycles  += t->dr.tstates_per_sample;
+        break;
+    }
+
+    // ── Generalized Data (0x19) ─────────────────────────────────────────────
+    case TZX_PS_GDB: {
+        TZXGDBCtx *g = &t->gdb;
+        uint8_t maxp = (g->phase == 0) ? g->npp : g->npd;
+
+        // Avanzar al siguiente pulso dentro del símbolo actual
+        g->pulse_idx++;
+
+        // ¿Símbolo completado? (max pulsos alcanzado o pulso con duración 0)
+        bool sym_done = (g->pulse_idx >= maxp);
+        if (!sym_done && gdb_cur_pulse_len(t, g) == 0)
+            sym_done = true;
+
+        if (sym_done) {
+            // Símbolo completado → avanzar al siguiente
+            if (g->phase == 0) {
+                // Fase piloto: avanzar repetición / PRLE
+                g->sym_rep++;
+                if (g->sym_rep >= g->cur_reps) {
+                    // Todas las repeticiones de este PRLE hechas
+                    g->prle_idx++;
+                    if (g->prle_idx >= g->totp) {
+                        // Piloto terminado → pasar a datos
+                        if (g->totd > 0) {
+                            g->phase        = 1;
+                            g->data_sym_done = 0;
+                            g->data_bit_pos  = 0;
+                            g->cur_sym       = gdb_read_data_symbol(t, g);
+                            g->pulse_idx     = 0;
+                            gdb_apply_edge(t, g);
+                            t->pulse_cycles += gdb_cur_pulse_len(t, g);
+                            break;
+                        }
+                        goto gdb_end_block;
+                    }
+                    // Cargar siguiente PRLE
+                    uint32_t po   = g->pilot_prle_off + g->prle_idx * 3;
+                    g->cur_sym    = t->data[po];
+                    g->cur_reps   = rd16(t->data + po + 1);
+                    g->sym_rep    = 0;
+                }
+                g->pulse_idx = 0;
+            } else {
+                // Fase datos: siguiente símbolo
+                g->data_sym_done++;
+                if (g->data_sym_done >= g->totd) {
+                    goto gdb_end_block;
+                }
+                g->cur_sym   = gdb_read_data_symbol(t, g);
+                g->pulse_idx = 0;
+            }
+            // Emitir primer pulso del nuevo símbolo
+            gdb_apply_edge(t, g);
+            t->pulse_cycles += gdb_cur_pulse_len(t, g);
+            break;
+
+            gdb_end_block:
+            if (g->pause_ms > 0) {
+                t->pulse_state   = TZX_PS_PAUSE;
+                t->pulse_cycles += (int32_t)TZX_MS_TO_TSTATES(g->pause_ms);
+                t->ear           = 0;
+            } else {
+                tzx_next_block(t);
+            }
+            break;
+        }
+
+        // Pulso intermedio dentro del símbolo actual (no es el primero)
+        gdb_apply_edge(t, g);
+        t->pulse_cycles += gdb_cur_pulse_len(t, g);
         break;
     }
 
