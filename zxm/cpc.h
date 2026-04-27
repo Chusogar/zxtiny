@@ -51,7 +51,7 @@ typedef struct {
 } CRTC;
 
 // -----------------------------
-// Máquina CPC
+// MÃ¡quina CPC
 // -----------------------------
 typedef struct {
     z80 cpu;
@@ -73,7 +73,7 @@ typedef struct {
     uint8_t ram_bank_config;
     uint8_t pen_selected;
 
-    // Periféricos
+    // PerifÃ©ricos
     PPI ppi;
     PSG psg;
     CRTC crtc;
@@ -83,14 +83,14 @@ typedef struct {
 
     uint8_t keyboard_matrix[10];
 
-    // SDL vídeo
+    // SDL vÃ­deo
     SDL_Window* window;
     SDL_Renderer* renderer;
     SDL_Texture* texture;
-    uint32_t screen_buffer[800 * 300];
+    uint32_t screen_buffer[768 * 544];
 
     // -----------------------------
-    // SDL audio (cola) + sincronía
+    // SDL audio (cola) + sincronÃ­a
     // -----------------------------
     SDL_AudioDeviceID audio_dev;
     int audio_rate;
@@ -101,7 +101,7 @@ typedef struct {
     int16_t audio_mixbuf[4096];
     int audio_mixpos;
 
-    // Estado ejecución
+    // Estado ejecuciÃ³n
     bool quit;
     uint64_t total_cycles;
     int cycles_in_frame;

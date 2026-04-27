@@ -39,7 +39,7 @@ static inline int16_t clamp16(int v) {
 }
 
 // -----------------------------------------------------------------------------
-// AY volumen aproximado (tabla típica AY)
+// AY volumen aproximado (tabla tÃ­pica AY)
 // -----------------------------------------------------------------------------
 static const float ay_vol_table[16] = {
     0.0f,
@@ -202,7 +202,7 @@ static void audio_flush(AmstradCPC* hw) {
     if (!hw->audio_dev) { hw->audio_mixpos = 0; return; }
     if (hw->audio_mixpos <= 0) return;
 
-    // Evita latencia acumulada (si SDL se queda atrás)
+    // Evita latencia acumulada (si SDL se queda atrÃ¡s)
     uint32_t queued = SDL_GetQueuedAudioSize(hw->audio_dev);
     uint32_t max_q = (uint32_t)(hw->audio_rate * 2 * sizeof(int16_t)); // ~2s
     if (queued > max_q) SDL_ClearQueuedAudio(hw->audio_dev);
@@ -240,7 +240,7 @@ static void cpc_audio_step(AmstradCPC* hw, int cpu_cycles) {
 }
 
 // -----------------------------------------------------------------------------
-// Gestión de memoria (paginación 128KB)
+// GestiÃ³n de memoria (paginaciÃ³n 128KB)
 // -----------------------------------------------------------------------------
 static uint8_t* get_read_ptr(AmstradCPC* hw, uint16_t addr) {
     uint8_t bank = (uint8_t)(addr >> 14);
@@ -294,30 +294,30 @@ static void mem_write(void* userdata, uint16_t addr, uint8_t val) {
 }
 
 // -----------------------------------------------------------------------------
-// Periféricos (I/O)
+// PerifÃ©ricos (I/O)
 // -----------------------------------------------------------------------------
 static uint8_t port_in(z80* z, uint16_t port) {
     AmstradCPC* hw = (AmstradCPC*)z->userdata;
 
     // ------------------------------------------------------------
-// FDC µPD765A (CPC 6128 / DDI-1) - decodificación recomendable
-// Puertos típicos:
+// FDC ÂµPD765A (CPC 6128 / DDI-1) - decodificaciÃ³n recomendable
+// Puertos tÃ­picos:
 //   &FA7E  (write) Motor On/Off flipflop
 //   &FB7E  (read)  765 MSR (Main Status Register)
 //   &FB7F  (r/w)   765 Data Register
-// Importante: decodificación parcial (A10=0, A7=0, A8 y A0 seleccionan) [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[3](https://www.cpcwiki.eu/index.php/765_FDC)
+// Importante: decodificaciÃ³n parcial (A10=0, A7=0, A8 y A0 seleccionan) [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[3](https://www.cpcwiki.eu/index.php/765_FDC)
 // ------------------------------------------------------------
 {
     uint16_t p = port;
 
     // Acceso al 765: requiere A10=0 (0x0400), A7=0 (0x0080) y A8=1 (0x0100).
-    // A0 selecciona MSR (0) o DATA (1). Los demás bits suelen ir a 1.
+    // A0 selecciona MSR (0) o DATA (1). Los demÃ¡s bits suelen ir a 1.
     if ( (p & 0x0480) == 0x0000 ) {          // A10=0 y A7=0
         if ( (p & 0x0100) == 0x0100 ) {      // A8=1 => 765 regs
             if ( (p & 0x0001) == 0 ) return fdc_read_status(&hw->fdc); // &FB7E
             else                    return fdc_read_data(&hw->fdc);   // &FB7F
         }
-        // &FA7E (motor) no tiene lectura útil
+        // &FA7E (motor) no tiene lectura Ãºtil
     }
 }
 
@@ -343,18 +343,18 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
     AmstradCPC* hw = (AmstradCPC*)z->userdata;
 
     // ------------------------------------------------------------
-// FDC µPD765A - puertos CPC correctos [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[2](https://cpcrulez.fr/codingBOOK_soft158a-ddi-1_firmware_0500.htm)
+// FDC ÂµPD765A - puertos CPC correctos [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[2](https://cpcrulez.fr/codingBOOK_soft158a-ddi-1_firmware_0500.htm)
 //   &FA7E (write) Motor On/Off (bit0)
 //   &FB7F (write) Data register
 //   &FB7E (write) no usado (MSR es read-only)
-// Decodificación parcial: A10=0, A7=0, A8 selecciona 765, A0 selecciona MSR/DATA [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[3](https://www.cpcwiki.eu/index.php/765_FDC)
+// DecodificaciÃ³n parcial: A10=0, A7=0, A8 selecciona 765, A0 selecciona MSR/DATA [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[3](https://www.cpcwiki.eu/index.php/765_FDC)
 // ------------------------------------------------------------
 {
     uint16_t p = port;
 
     if ( (p & 0x0480) == 0x0000 ) {          // A10=0 y A7=0
         if ( (p & 0x0100) == 0x0000 ) {
-            // A8=0 y típicamente &FA7E: motor flip-flop (solo escritura)
+            // A8=0 y tÃ­picamente &FA7E: motor flip-flop (solo escritura)
             // En CPC: escribir 0x00 apaga, 0x01 enciende (bit0) [1](https://www.cpcwiki.eu/index.php?title=765_FDC&redirect=no&mobileaction=toggle_view_desktop)[2](https://cpcrulez.fr/codingBOOK_soft158a-ddi-1_firmware_0500.htm)
             if ( (p & 0x00FF) == 0x7E ) {
                 fdc_motor_control(&hw->fdc, val & 1);
@@ -414,7 +414,7 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
         if ((port & 0x0300) == 0x0200) {
             hw->ppi.port_c = val;
 
-            // Simplificación BDIR/BC1 usando bits 7..6 de portC como ya hacías:
+            // SimplificaciÃ³n BDIR/BC1 usando bits 7..6 de portC como ya hacÃ­as:
             // 11 => latch address (reg = portA[3:0])
             // 10 => write data   (data = portA)
             uint8_t ctrl = (uint8_t)(val >> 6);
@@ -457,7 +457,7 @@ static int sna_rle_unpack_64k(uint8_t *out64k, const uint8_t *in, size_t inlen) 
 }
 
 // -----------------------------------------------------------------------------
-// Carga de SNA (tu lógica + resync PSG + limpiar cola audio)
+// Carga de SNA (tu lÃ³gica + resync PSG + limpiar cola audio)
 // -----------------------------------------------------------------------------
 int cpc_load_sna(AmstradCPC* hw, const char* filename) {
     FILE* f = fopen(filename, "rb");
@@ -561,7 +561,7 @@ int cpc_load_sna(AmstradCPC* hw, const char* filename) {
     psg_recalc_periods(&hw->psg);
     psg_restart_envelope(&hw->psg);
 
-    // Limpia audio para evitar “latigazo”
+    // Limpia audio para evitar Â“latigazoÂ”
     if (hw->audio_dev) SDL_ClearQueuedAudio(hw->audio_dev);
     hw->audio_sample_accum = 0;
     hw->ay_tick_accum = 0;
@@ -608,13 +608,13 @@ void cpc_handle_key(AmstradCPC* hw, SDL_Scancode key, bool pressed) {
         // Fila 2
         case SDL_SCANCODE_HOME:
         case SDL_SCANCODE_INSERT:    row=2; bit=0; break; // Tecla CLR
-        case SDL_SCANCODE_RIGHTBRACKET: row=2; bit=1; break; // [ (Físico: Tecla a la derecha de P)
+        case SDL_SCANCODE_RIGHTBRACKET: row=2; bit=1; break; // [ (FÃ­sico: Tecla a la derecha de P)
         case SDL_SCANCODE_RETURN:    row=2; bit=2; break;
-        case SDL_SCANCODE_BACKSLASH: row=2; bit=3; break; // ] (Físico: Tecla encima de Intro)
+        case SDL_SCANCODE_BACKSLASH: row=2; bit=3; break; // ] (FÃ­sico: Tecla encima de Intro)
         case SDL_SCANCODE_KP_4:      row=2; bit=4; break;
         case SDL_SCANCODE_LSHIFT:
         case SDL_SCANCODE_RSHIFT:    row=2; bit=5; break;
-        case SDL_SCANCODE_GRAVE:     row=2; bit=6; break; // \ (Físico: Tecla a la izquierda del 1)
+        case SDL_SCANCODE_GRAVE:     row=2; bit=6; break; // \ (FÃ­sico: Tecla a la izquierda del 1)
         case SDL_SCANCODE_LCTRL:
         case SDL_SCANCODE_RCTRL:     row=2; bit=7; break;
 
@@ -699,8 +699,8 @@ void cpc_handle_key(AmstradCPC* hw, SDL_Scancode key, bool pressed) {
    RENDERIZADO
    ============================================================ */
 
-// ---- helpers de decodificación CPC (formatos de píxel) ----
-// Mode 0: 2 píxeles por byte, 16 colores (4bpp), bits intercalados.
+// ---- helpers de decodificaciÃ³n CPC (formatos de pÃ­xel) ----
+// Mode 0: 2 pÃ­xeles por byte, 16 colores (4bpp), bits intercalados.
 // Pixel0 bits: b7->bit0, b3->bit1, b5->bit2, b1->bit3
 // Pixel1 bits: b6->bit0, b2->bit1, b4->bit2, b0->bit3
 // (ver "Display pixel data format") [1](https://cpctech.cpcwiki.de/docs/graphics.html)
@@ -717,7 +717,7 @@ static inline uint8_t cpc_mode0_pix1(uint8_t v) {
                      (((v >> 0) & 1) << 3));
 }
 
-// Mode 1: 4 píxeles por byte, 4 colores (2bpp), intercalado.
+// Mode 1: 4 pÃ­xeles por byte, 4 colores (2bpp), intercalado.
 // Pixel0: (b7 + b3<<1), Pixel1:(b6 + b2<<1), Pixel2:(b5 + b1<<1), Pixel3:(b4 + b0<<1) [1](https://cpctech.cpcwiki.de/docs/graphics.html)
 static inline uint8_t cpc_mode1_pix(uint8_t v, int p) {
     switch (p) {
@@ -729,13 +729,13 @@ static inline uint8_t cpc_mode1_pix(uint8_t v, int p) {
     }
 }
 
-// Mode 2: 8 píxeles por byte, 2 colores (1bpp), bits lineales b7..b0 [1](https://cpctech.cpcwiki.de/docs/graphics.html)
+// Mode 2: 8 pÃ­xeles por byte, 2 colores (1bpp), bits lineales b7..b0 [1](https://cpctech.cpcwiki.de/docs/graphics.html)
 static inline uint8_t cpc_mode2_pix(uint8_t v, int p) {
     return (uint8_t)((v >> (7 - p)) & 1);
 }
 
-// Mode 3 (no oficial): 2 píxeles por byte, 4 colores (2bpp), 4 bits no usados.
-// Normalmente se comporta como “modo 1 pero solo pixel0 y pixel1”, con píxel ancho (low-res). [1](https://cpctech.cpcwiki.de/docs/graphics.html)[4](https://retrocomputing.stackexchange.com/questions/1024/how-did-mode-3-on-the-amstrad-cpc-work)
+// Mode 3 (no oficial): 2 pÃ­xeles por byte, 4 colores (2bpp), 4 bits no usados.
+// Normalmente se comporta como Â“modo 1 pero solo pixel0 y pixel1Â”, con pÃ­xel ancho (low-res). [1](https://cpctech.cpcwiki.de/docs/graphics.html)[4](https://retrocomputing.stackexchange.com/questions/1024/how-did-mode-3-on-the-amstrad-cpc-work)
 static inline uint8_t cpc_mode3_pix0(uint8_t v) {
     return (uint8_t)(((v >> 7) & 1) | (((v >> 3) & 1) << 1));
 }
@@ -744,9 +744,16 @@ static inline uint8_t cpc_mode3_pix1(uint8_t v) {
 }
 
 void cpc_render(AmstradCPC* hw) {
-    // Rellena con el borde
+    // Dimensiones del buffer de salida (estilo CPCEC)
+    // 768Ã—544 con bordes, zona activa 640Ã—400 centrada
+    const int BUF_W = 768;
+    const int BUF_H = 544;
+    const int X0 = 64;  // margen izquierdo: (768-640)/2
+    const int Y0 = 72;  // margen superior:  (544-400)/2
+
+    // Rellena con el color del borde
     uint32_t border = hw_palette[hw->palette[16] & 0x1F];
-    for (int i = 0; i < 800 * 300; i++) hw->screen_buffer[i] = border;
+    for (int i = 0; i < BUF_W * BUF_H; i++) hw->screen_buffer[i] = border;
 
     // CRTC
     int width_chars  = hw->crtc.registers[1] ? hw->crtc.registers[1] : 40;
@@ -755,30 +762,15 @@ void cpc_render(AmstradCPC* hw) {
     uint16_t ma_base = (uint16_t)(((hw->crtc.registers[12] & 0x3F) << 8) | hw->crtc.registers[13]);
     uint16_t screen_start = (uint16_t)((ma_base & 0x3000) << 2);
 
-    // Parámetros de anchura “en píxeles de salida” (tu buffer es 800x300)
-    const int X0 = 80; // margen izquierdo como tenías
     int mode = (int)(hw->screen_mode & 3);
 
-    // En tu renderer actual:
-    // - Mode2: 16 pix/char (2 bytes * 8 pix)
-    // - Mode1:  8 pix/char (2 bytes * 4 pix)
-    // - Mode0:  8 pix/char (2 bytes * 2 pix *2 ancho)
-    // - Mode3:  8 pix/char (2 bytes * 2 pix *2 ancho)
-    int char_w = (mode == 2) ? 16 : 8;
-
-    // Por byte:
-    // - Mode2: 8 columnas
-    // - Mode1: 4 columnas
-    // - Mode0: 4 columnas (2 píxeles duplicados horizontalmente)
-    // - Mode3: 4 columnas (2 píxeles duplicados horizontalmente)
-    int byte_w;
-    if (mode == 2) byte_w = 8;
-    else byte_w = 4;
-
+        // Todos los modos producen 16 pÃ­xeles por carÃ¡cter (= 8 por byte),
+    // igual que CPCEC: 40 chars Ã— 16 = 640 pÃ­xeles activos.
+    // Cada scanline se duplica verticalmente (200 lÃ­neas â†’ 400).
     for (int char_y = 0; char_y < height_chars; char_y++) {
         for (int scanline = 0; scanline < 8; scanline++) {
-            int y = (char_y * 8) + scanline;
-            if (y >= 300) break;
+            int y = Y0 + (char_y * 16) + (scanline * 2);
+            if (y + 1 >= BUF_H) break;
 
             uint16_t ma_row = (uint16_t)((ma_base & 0x03FF) + (char_y * width_chars));
             uint16_t line_addr = (uint16_t)(screen_start |
@@ -788,63 +780,67 @@ void cpc_render(AmstradCPC* hw) {
             for (int x = 0; x < width_chars; x++) {
                 for (int b = 0; b < 2; b++) {
                     uint8_t v = hw->ram[(line_addr + (x * 2) + b) & 0xFFFF];
-                    int px_x = X0 + (x * char_w) + (b * byte_w);
+                    int px_x = X0 + (x * 16) + (b * 8);
 
                     if (mode == 0) {
-                        // MODE 0: 2 píxeles/byte, 4 bits por píxel, cada píxel “ancho” (duplicamos)
                         uint8_t pen0 = cpc_mode0_pix0(v) & 0x0F;
                         uint8_t pen1 = cpc_mode0_pix1(v) & 0x0F;
-
                         uint32_t c0 = hw_palette[hw->palette[pen0] & 0x1F];
                         uint32_t c1 = hw_palette[hw->palette[pen1] & 0x1F];
-
-                        // pixel 0 (x2), pixel 1 (x2)
-                        hw->screen_buffer[y * 800 + px_x + 0] = c0;
-                        hw->screen_buffer[y * 800 + px_x + 1] = c0;
-                        hw->screen_buffer[y * 800 + px_x + 2] = c1;
-                        hw->screen_buffer[y * 800 + px_x + 3] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 0] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 1] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 2] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 3] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 4] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 5] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 6] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 7] = c1;
                     }
                     else if (mode == 1) {
-                        // MODE 1: 4 píxeles/byte, 2 bits por píxel
                         for (int p = 0; p < 4; p++) {
                             uint8_t pen = cpc_mode1_pix(v, p) & 0x03;
-                            hw->screen_buffer[y * 800 + px_x + p] =
-                                hw_palette[hw->palette[pen] & 0x1F];
+                            uint32_t c = hw_palette[hw->palette[pen] & 0x1F];
+                            hw->screen_buffer[y * BUF_W + px_x + p * 2 + 0] = c;
+                            hw->screen_buffer[y * BUF_W + px_x + p * 2 + 1] = c;
                         }
                     }
                     else if (mode == 2) {
-                        // MODE 2: 8 píxeles/byte, 1 bit por píxel
                         for (int p = 0; p < 8; p++) {
                             uint8_t pen = cpc_mode2_pix(v, p) & 0x01;
-                            hw->screen_buffer[y * 800 + px_x + p] =
+                            hw->screen_buffer[y * BUF_W + px_x + p] =
                                 hw_palette[hw->palette[pen] & 0x1F];
                         }
                     }
-                    else { // mode == 3
-                        // MODE 3 (no oficial): 2 píxeles/byte, 2 bits por píxel, píxel ancho (duplicamos)
+                    else {
                         uint8_t pen0 = cpc_mode3_pix0(v) & 0x03;
                         uint8_t pen1 = cpc_mode3_pix1(v) & 0x03;
-
                         uint32_t c0 = hw_palette[hw->palette[pen0] & 0x1F];
                         uint32_t c1 = hw_palette[hw->palette[pen1] & 0x1F];
-
-                        hw->screen_buffer[y * 800 + px_x + 0] = c0;
-                        hw->screen_buffer[y * 800 + px_x + 1] = c0;
-                        hw->screen_buffer[y * 800 + px_x + 2] = c1;
-                        hw->screen_buffer[y * 800 + px_x + 3] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 0] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 1] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 2] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 3] = c0;
+                        hw->screen_buffer[y * BUF_W + px_x + 4] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 5] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 6] = c1;
+                        hw->screen_buffer[y * BUF_W + px_x + 7] = c1;
                     }
                 }
             }
+
+            memcpy(&hw->screen_buffer[(y + 1) * BUF_W],
+                   &hw->screen_buffer[y * BUF_W],
+                   (size_t)BUF_W * sizeof(uint32_t));
         }
     }
 
-    SDL_UpdateTexture(hw->texture, NULL, hw->screen_buffer, 800 * 4);
+    SDL_UpdateTexture(hw->texture, NULL, hw->screen_buffer, BUF_W * 4);
     SDL_RenderCopy(hw->renderer, hw->texture, NULL, NULL);
     SDL_RenderPresent(hw->renderer);
-}
+}}
 
 // -----------------------------------------------------------------------------
-// Ejecución de frame (CPU + IRQ + FDC + AUDIO)
+// EjecuciÃ³n de frame (CPU + IRQ + FDC + AUDIO)
 // -----------------------------------------------------------------------------
 void cpc_run_frame(AmstradCPC* hw) {
     hw->cycles_in_frame = 0;
@@ -854,7 +850,7 @@ void cpc_run_frame(AmstradCPC* hw) {
         hw->cycles_in_frame += c;
         hw->irq_counter += c;
 
-        // AUDIO: genera muestras según ciclos
+        // AUDIO: genera muestras segÃºn ciclos
         cpc_audio_step(hw, c);
 
         // FDC
@@ -873,7 +869,7 @@ void cpc_run_frame(AmstradCPC* hw) {
 }
 
 // -----------------------------------------------------------------------------
-// Inicialización y ROMs
+// InicializaciÃ³n y ROMs
 // -----------------------------------------------------------------------------
 void cpc_init(AmstradCPC* hw) {
     memset(hw, 0, sizeof(AmstradCPC));
@@ -906,11 +902,12 @@ void cpc_init(AmstradCPC* hw) {
 
     hw->window = SDL_CreateWindow("Amstrad CPC 6128",
                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                  800, 600, 0);
+                                  768, 544, SDL_WINDOW_RESIZABLE);
 
     hw->renderer = SDL_CreateRenderer(hw->window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_RenderSetLogicalSize(hw->renderer, 768, 544);
     hw->texture = SDL_CreateTexture(hw->renderer, SDL_PIXELFORMAT_ARGB8888,
-                                    SDL_TEXTUREACCESS_STREAMING, 800, 300);
+                                    SDL_TEXTUREACCESS_STREAMING, 768, 544);
 
     // Audio init (queue)
     SDL_AudioSpec want, have;
@@ -945,7 +942,7 @@ int cpc_load_roms(AmstradCPC* hw, const char* firmware_basic_32k, const char* fi
     fclose(f);
 
     if (read_lower != 16384 || read_upper != 16384) {
-        printf("Aviso: ROM 32KB no tiene tamaño esperado.\n");
+        printf("Aviso: ROM 32KB no tiene tamaÃ±o esperado.\n");
         return -2;
     }
     printf("ROM 32KB (Firmware+Basic) cargada correctamente.\n");
@@ -957,7 +954,7 @@ int cpc_load_roms(AmstradCPC* hw, const char* firmware_basic_32k, const char* fi
     fclose(f);
 
     if (read_amsdos != 16384) {
-        printf("Aviso: ROM AMSDOS no tiene tamaño esperado.\n");
+        printf("Aviso: ROM AMSDOS no tiene tamaÃ±o esperado.\n");
         return -4;
     }
     printf("ROM AMSDOS 16KB cargada correctamente.\n");
@@ -992,7 +989,7 @@ for (int i = 1; i < argc; i++) {
     if (!strcasecmp(ext, ".sna")) {
         cpc_load_sna(&cpc, argv[i]);
     } else if (!strcasecmp(ext, ".dsk")) {
-        int d = (drive_to_mount < 2) ? drive_to_mount : 0; // si pasan más, sobreescribe A
+        int d = (drive_to_mount < 2) ? drive_to_mount : 0; // si pasan mÃ¡s, sobreescribe A
         if (fdc_load_dsk(&cpc.fdc, d, argv[i]) == 0) {
             // si tu FDC no marca ready internamente, fuerza ready
             cpc.fdc.drives[d].ready = true;
