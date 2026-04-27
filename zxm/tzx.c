@@ -350,10 +350,11 @@ static void tzx_tzx10(TZXPlayer* t, int q, int l) {
 static void tzx_tzx19(TZXPlayer* t, int n, int m) {
     for (int i = 0, j; i < n; ++i) {
         t->codeitem[i][0] = (int16_t)tzx_getc(t); // edge type
-        for (j = 1; j <= m; ++j)
+        for (j = 1; j <= m && j < 31; ++j)
             if ((t->codeitem[i][j] = (int16_t)tzx_getcc(t)) < 1)
                 t->codeitem[i][j] = -1; // ZERO es marcador de fin anticipado
-        t->codeitem[i][j] = -1; // marcador de fin normal
+        for (; j <= m; ++j) tzx_getcc(t); // consume remaining pulses that don't fit
+        t->codeitem[i][j < 32 ? j : 31] = -1; // marcador de fin normal
     }
 }
 
@@ -655,7 +656,7 @@ void tzx_update(TZXPlayer* t, int cycles) {
                     if (t->item++) t->ear ^= 1;
                 } else {
                     t->item = 0;
-                    if (--t->time_count)
+                    if (t->time_count > 0 && --t->time_count)
                         t->code = t->codeitem[t->byte_val]; // reiniciar símbolo
                     else
                         --t->tones; // siguiente entrada PRLE
