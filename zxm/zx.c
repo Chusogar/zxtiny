@@ -531,6 +531,8 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
         case SDL_SCANCODE_F2:
             if (pressed) {
                 s->turbo_mode = !s->turbo_mode;
+                if (!s->turbo_mode && s->audio_dev > 0)
+                    SDL_ClearQueuedAudio(s->audio_dev);
                 printf("[EMU] Velocidad %s\n", s->turbo_mode ? "MAXIMA" : "normal");
             }
             return;
@@ -617,7 +619,8 @@ void spectrum_run_frame(ZXSpectrum* s) {
     }
 
     if (s->audio_dev > 0 && s->audio_pos > 0) {
-        SDL_QueueAudio(s->audio_dev, s->audio_buffer, s->audio_pos * sizeof(float));
+        if (!s->turbo_mode)
+            SDL_QueueAudio(s->audio_dev, s->audio_buffer, s->audio_pos * sizeof(float));
         s->audio_pos = 0;
     }
     s->frame_counter++;
