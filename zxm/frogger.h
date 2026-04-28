@@ -133,6 +133,7 @@ typedef struct {
 
     // Audio
     AY8910 ay[2];
+    uint8_t ay_sel;  // chip AY seleccionado actualmente (0 o 1)
     SDL_AudioDeviceID audio_dev;
     float audio_buffer[882];
     int   audio_pos;

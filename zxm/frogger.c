@@ -277,9 +277,7 @@ static uint8_t sound_port_in(z80* z, uint16_t port) {
     uint8_t p = port & 0xFF;
 
     if (p == 0x40) {
-        // AY read: latch selects which AY and register
-        // Frogger uses 2 AY chips. Port A of AY#1 receives the sound command
-        int chip = (f->ay[0].latch >= AY_NUM_REGS) ? 1 : 0;
+        int chip = f->ay_sel;
         if (chip == 0 && f->ay[0].latch == 14)
             return f->sound_cmd; // Port A = sound command from main CPU
         return ay_read_reg(&f->ay[chip]);
@@ -295,14 +293,13 @@ static void sound_port_out(z80* z, uint16_t port, uint8_t val) {
     if (p == 0x80) {
         // AY address latch
         // Frogger maps: bits 0-3 = register, bit 4 = chip select
-        int chip = (val >> 4) & 1;
-        f->ay[chip].latch = val & 0x0F;
+        f->ay_sel = (val >> 4) & 1;
+        f->ay[f->ay_sel].latch = val & 0x0F;
     } else if (p == 0x40) {
-        // AY data write
-        for (int i = 0; i < 2; i++) {
-            if (f->ay[i].latch < AY_NUM_REGS)
-                ay_write_reg(&f->ay[i], f->ay[i].latch, val);
-        }
+        // AY data write (solo al chip seleccionado)
+        int chip = f->ay_sel;
+        if (f->ay[chip].latch < AY_NUM_REGS)
+            ay_write_reg(&f->ay[chip], f->ay[chip].latch, val);
     }
 }
 
