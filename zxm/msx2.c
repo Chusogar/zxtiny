@@ -191,13 +191,11 @@ static void vdp_render_g4(MSX2_VDP* v, int line, uint32_t* buf) {
 static void vdp_render_g5(MSX2_VDP* v, int line, uint32_t* buf) {
     uint32_t base = (uint32_t)(v->regs[2] & 0x60) << 10;
     uint32_t addr = base + (uint32_t)line * 128;
-    for (int x = 0; x < 256; x += 4) {
+    for (int x = 0; x < 256; x += 2) {
         uint8_t byte = vram_rd(v, addr++);
-        // 4 pixels per byte, 2 bits each, but we map to 256-wide
+        // 4 pixels per byte, 2 bits each; take pixels 0 and 2 for 2:1 downscale
         buf[x]     = v->palette[(byte >> 6) & 3];
-        buf[x + 1] = v->palette[(byte >> 4) & 3];
-        buf[x + 2] = v->palette[(byte >> 2) & 3];
-        buf[x + 3] = v->palette[byte & 3];
+        buf[x + 1] = v->palette[(byte >> 2) & 3];
     }
 }
 
@@ -367,7 +365,7 @@ static void vdp_render_line(MSX2_VDP* v, int line, uint32_t* fb) {
 // Logical operation
 static uint8_t vdp_log_op(int op, uint8_t src, uint8_t dst) {
     switch (op & 0x0F) {
-    case 0x0: return dst;              // IMP
+    case 0x0: return src;              // IMP
     case 0x1: return src & dst;        // AND
     case 0x2: return src | dst;        // OR
     case 0x3: return src ^ dst;        // XOR
@@ -985,10 +983,10 @@ static uint8_t megarom_read(MSX2* m, uint16_t addr) {
     switch (m->mem.cart_mapper) {
     case MAPPER_ASCII8:
     case MAPPER_KONAMI_SCC:
-        bank_idx = (addr >> 13) & 3; // 0x4000→0, 0x6000→1, 0x8000→2, 0xA000→3
+        bank_idx = (addr >> 13) - 2; // 0x4000→0, 0x6000→1, 0x8000→2, 0xA000→3
         break;
     case MAPPER_KONAMI:
-        bank_idx = (addr >> 13) & 3;
+        bank_idx = (addr >> 13) - 2;
         break;
     case MAPPER_ASCII16: {
         int page16 = (addr >> 14) & 1; // 0x4000 or 0x8000
@@ -1149,11 +1147,11 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
     switch (p) {
     // VDP
     case 0x98: case 0x99: case 0x9A: case 0x9B:
-        vdp_port_write(&m->vdp, p - 0x98, val);
-        if (m->vdp.cmd_busy && (p == 0x98 || p == 0x9B)) {
-            // If a CPU→VRAM command is active, feed the byte
-            if ((m->vdp.cmd_op == 0x0B || m->vdp.cmd_op == 0x0F) && p == 0x98)
-                vdp_cmd_write_byte(&m->vdp, val);
+        if (m->vdp.cmd_busy && (m->vdp.cmd_op == 0x0B || m->vdp.cmd_op == 0x0F) && p == 0x98) {
+            // During LMMC/HMMC, port 0 writes feed the command engine only
+            vdp_cmd_write_byte(&m->vdp, val);
+        } else {
+            vdp_port_write(&m->vdp, p - 0x98, val);
         }
         break;
 
