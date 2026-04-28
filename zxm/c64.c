@@ -779,7 +779,7 @@ static uint8_t* d64_get_sector(C64* c, int track, int sector) {
     return c->disk.data + offset;
 }
 
-static int d64_load_file(C64* c, const char* filename, int namelen, uint16_t* load_addr) {
+static int d64_load_file(C64* c, const char* filename, int namelen, uint16_t* load_addr, bool use_file_addr) {
     // Search directory (track 18, starting at sector 1)
     int dir_track = D64_BAM_TRACK;
     int dir_sector = 1;
@@ -826,8 +826,9 @@ static int d64_load_file(C64* c, const char* filename, int namelen, uint16_t* lo
 
                 if (first_sector) {
                     addr = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
-                    *load_addr = addr;
-                    ptr = addr;
+                    if (use_file_addr)
+                        *load_addr = addr;
+                    ptr = *load_addr;
                     for (int i = 4; i < data_len + 2; i++) {
                         if (ptr < 0xFFFF) c->ram[ptr++] = data[i];
                     }
@@ -877,7 +878,8 @@ static void d64_kernal_trap(C64* c) {
         load_addr = (uint16_t)c->ram[0x2B] | ((uint16_t)c->ram[0x2C] << 8);
     }
 
-    int result = d64_load_file(c, filename, namelen, &load_addr);
+    bool use_file_addr = (sa != 0); // sa=0: load to BASIC area, sa=1: load to file address
+    int result = d64_load_file(c, filename, namelen, &load_addr, use_file_addr);
 
     if (result >= 0) {
         // Success: set end address, clear carry (no error)
