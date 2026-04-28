@@ -121,6 +121,7 @@ typedef struct {
     uint8_t ear_bit;
     uint8_t mic_bit;
     uint8_t keyboard_matrix[8];
+    uint8_t kempston;              // Kempston joystick (bits: 4=fire 3=up 2=down 1=left 0=right)
 
     // ── Audio SDL ────────────────────────────────────────────────────
     SDL_AudioDeviceID audio_dev;
