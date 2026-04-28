@@ -212,10 +212,16 @@ static uint8_t port_in(z80* z, uint16_t port) {
         for (int i = 0; i < 8; i++)
             if ((port & (1 << (i + 8))) == 0)
                 result &= s->keyboard_matrix[i];
-        if (s->mic_bit) result |=  0x40;
-        else            result &= ~0x40;
+        // Bit 6: EAR input = speaker output OR tape signal
+        uint8_t ear_in = s->ear_bit | s->mic_bit;
+        if (ear_in) result |=  0x40;
+        else        result &= ~0x40;
         return result;
     }
+
+    // Puerto Kempston joystick (port 0x1F, decodificación: A5=0, A6=0, A7=0)
+    if ((port & 0xE0) == 0)
+        return s->kempston;
 
     // Floating bus: puertos no decodificados devuelven lo que la ULA lee
     int fb = ula_recv_floating(s);
@@ -525,6 +531,18 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
         case SDL_SCANCODE_M:      row=7; bit=2; break;
         case SDL_SCANCODE_N:      row=7; bit=3; break;
         case SDL_SCANCODE_B:      row=7; bit=4; break;
+        // Kempston joystick via teclas de cursor + RAlt/RCtrl = fire
+        case SDL_SCANCODE_RIGHT:
+            if (pressed) s->kempston |= 0x01; else s->kempston &= ~0x01; return;
+        case SDL_SCANCODE_LEFT:
+            if (pressed) s->kempston |= 0x02; else s->kempston &= ~0x02; return;
+        case SDL_SCANCODE_DOWN:
+            if (pressed) s->kempston |= 0x04; else s->kempston &= ~0x04; return;
+        case SDL_SCANCODE_UP:
+            if (pressed) s->kempston |= 0x08; else s->kempston &= ~0x08; return;
+        case SDL_SCANCODE_RALT:
+        case SDL_SCANCODE_RCTRL:
+            if (pressed) s->kempston |= 0x10; else s->kempston &= ~0x10; return;
         case SDL_SCANCODE_F1:
             if (pressed) spectrum_tape_start(s);
             return;
@@ -689,6 +707,7 @@ int main(int argc, char* argv[]) {
         printf("  F1 -> iniciar/rebobinar cinta\n");
         printf("  F2 -> velocidad maxima / normal\n");
         printf("  F3 -> detener cinta\n");
+        printf("  Cursores -> joystick Kempston,  RAlt/RCtrl -> fire\n");
     }
 
     const uint32_t FRAME_MS = 1000 / 50;
