@@ -1238,6 +1238,12 @@ void c64_destroy(C64* c) {
 // =============================================================================
 
 void c64_run_frame(C64* c) {
+    // Deferred PRG load: wait for BASIC to finish initialization
+    if (c->prg_pending && c->frame_counter >= 100) {
+        c64_load_prg(c, c->pending_prg);
+        c->prg_pending = false;
+    }
+
     int cycles_done = 0;
     float sample_accum = (float)C64_CPU_FREQ / (float)C64_AUDIO_RATE;
     float next_sample_at = 0.0f;
@@ -1365,8 +1371,10 @@ int main(int argc, char* argv[]) {
     // Load files from command line
     for (int i = 1; i < argc; i++) {
         if (ext_eq(argv[i], ".prg")) {
-            c64_load_prg(&c64, argv[i]);
-            printf("PRG cargado. Escribe RUN para ejecutar.\n");
+            strncpy(c64.pending_prg, argv[i], sizeof(c64.pending_prg) - 1);
+            c64.pending_prg[sizeof(c64.pending_prg) - 1] = '\0';
+            c64.prg_pending = true;
+            printf("PRG pendiente. Escribe RUN para ejecutar.\n");
         } else if (ext_eq(argv[i], ".d64")) {
             if (c64_load_d64(&c64, argv[i]) == 0)
                 printf("D64 montado: %s\n  LOAD\"$\",8 para directorio, LOAD\"*\",8,1 para primer programa\n", argv[i]);
