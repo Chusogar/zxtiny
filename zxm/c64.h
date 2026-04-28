@@ -225,6 +225,9 @@ typedef struct {
     // Estado
     bool quit;
     bool turbo_mode;
+    // PRG pendiente (carga diferida para que BASIC se inicialice primero)
+    char pending_prg[512];
+    bool prg_pending;
     int  frame_counter;
 } C64;
 
