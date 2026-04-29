@@ -1086,7 +1086,153 @@ static void d64_kernal_trap(C64* c) {
         load_addr = (uint16_t)c->ram[0x2D] | ((uint16_t)c->ram[0x2E] << 8);
     }
 
-    int result = d64_load_file(c, filename, flen, &load_addr, use_file_addr);
+    int result;
+
+    // LOAD"$",8 → build directory listing as a BASIC program
+    if (flen == 1 && filename[0] == '$') {
+        // Build a fake BASIC program at load_addr (or $0801 if sa==0)
+        uint16_t addr = use_file_addr ? 0x0801 : load_addr;
+        if (!use_file_addr) addr = 0x0801;
+        uint8_t* p = c->ram + addr;
+        uint8_t* base = p;
+
+        // Helper: write a BASIC line
+        // Format: link_lo link_hi line_lo line_hi text... $00
+        // We'll fix up links after.
+        #define EMIT(b) *p++ = (uint8_t)(b)
+        #define EMIT_STR(s) do { const char* _s=(s); while(*_s) EMIT((uint8_t)*_s++); } while(0)
+
+        // Read disk name from BAM sector (track 18, sector 0)
+        uint8_t* bam = d64_get_sector(c, 18, 0);
+        char disk_name[17] = "????????????????";
+        char disk_id[6]    = "??";
+        if (bam) {
+            for (int i = 0; i < 16; i++) {
+                uint8_t ch = bam[0x90 + i];
+                disk_name[i] = (ch == 0xA0) ? ' ' : (char)ch;
+            }
+            disk_name[16] = 0;
+            disk_id[0] = (char)bam[0xA2];
+            disk_id[1] = (char)bam[0xA3];
+            disk_id[2] = 0;
+        }
+
+        // Line 0: disk header  0 "DISKNAME" ID
+        uint8_t* line_start = p;
+        p += 2; // link placeholder
+        EMIT(0x00); EMIT(0x00); // line number 0
+        EMIT(0x12); // RVS ON (PETSCII reverse)
+        EMIT('"');
+        EMIT_STR(disk_name);
+        EMIT('"');
+        EMIT(' ');
+        EMIT_STR(disk_id);
+        EMIT(0x00);
+        // fix link
+        uint16_t next = (uint16_t)(addr + (p - base));
+        line_start[0] = (uint8_t)(next & 0xFF);
+        line_start[1] = (uint8_t)(next >> 8);
+
+        // Directory entries
+        int dir_track = 18, dir_sector = 1;
+        while (dir_track != 0) {
+            uint8_t* sec = d64_get_sector(c, dir_track, dir_sector);
+            if (!sec) break;
+            for (int entry = 0; entry < 8; entry++) {
+                uint8_t* e = sec + 2 + entry * 32;
+                if ((e[0] & 0x07) == 0) continue; // scratched
+
+                // Blocks used (at offset 28-29 in entry)
+                uint16_t blocks = (uint16_t)e[28] | ((uint16_t)e[29] << 8);
+
+                // File type string
+                static const char* ftypes[] = {"DEL","SEQ","PRG","USR","REL","???","???","???"};
+                const char* ftype = ftypes[e[0] & 0x07];
+                bool closed = (e[0] & 0x80) != 0;
+                bool locked = (e[0] & 0x40) != 0;
+
+                // Filename (strip $A0 padding)
+                char fname[17];
+                int fnlen = 0;
+                for (int i = 0; i < 16; i++) {
+                    if (e[3+i] == 0xA0) break;
+                    fname[fnlen++] = (char)e[3+i];
+                }
+                fname[fnlen] = 0;
+
+                line_start = p;
+                p += 2; // link placeholder
+                EMIT((uint8_t)(blocks & 0xFF));
+                EMIT((uint8_t)(blocks >> 8));
+
+                // Padding so filename column lines up
+                char blk_str[6];
+                snprintf(blk_str, sizeof(blk_str), "%u", blocks);
+                int pad = 3 - (int)strlen(blk_str);
+                for (int i = 0; i < pad; i++) EMIT(' ');
+
+                EMIT('"');
+                EMIT_STR(fname);
+                EMIT('"');
+                // pad to 16 chars
+                for (int i = fnlen; i < 16; i++) EMIT(' ');
+                EMIT(' ');
+                if (!closed) EMIT('*');
+                EMIT_STR(ftype);
+                if (locked) EMIT('<');
+                EMIT(0x00);
+
+                next = (uint16_t)(addr + (p - base));
+                line_start[0] = (uint8_t)(next & 0xFF);
+                line_start[1] = (uint8_t)(next >> 8);
+            }
+            dir_track  = sec[0];
+            dir_sector = sec[1];
+        }
+
+        // Blocks free line
+        // Count free blocks from BAM
+        int free_blocks = 0;
+        if (bam) {
+            for (int t = 1; t <= 35; t++) {
+                if (t == 18) continue;
+                free_blocks += bam[4 + (t-1)*4]; // byte 0 of each BAM entry = free blocks
+            }
+        }
+        line_start = p;
+        p += 2;
+        EMIT((uint8_t)(free_blocks & 0xFF));
+        EMIT((uint8_t)(free_blocks >> 8));
+        EMIT_STR("BLOCKS FREE.");
+        EMIT(0x00);
+        // final link = 0000
+        line_start[0] = 0x00;
+        line_start[1] = 0x00;
+
+        // End of program
+        EMIT(0x00); EMIT(0x00);
+
+        #undef EMIT
+        #undef EMIT_STR
+
+        uint16_t end_addr = (uint16_t)(addr + (p - base));
+        c->ram[0x2D] = (uint8_t)(end_addr & 0xFF);
+        c->ram[0x2E] = (uint8_t)(end_addr >> 8);
+        c->ram[0xAE] = c->ram[0x2D];
+        c->ram[0xAF] = c->ram[0x2E];
+        c->cpu.x  = c->ram[0xAE];
+        c->cpu.y  = c->ram[0xAF];
+        c->cpu.cf = 0;
+        c->cpu.a  = 0;
+        uint8_t rlo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
+        uint8_t rhi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
+        c->cpu.sp += 2;
+        c->cpu.pc  = (((uint16_t)rhi << 8) | rlo) + 1;
+        printf("D64 DIR OK: %d bytes\n", (int)(end_addr - addr));
+        return;
+    }
+
+    result = d64_load_file(c, filename, flen, &load_addr, use_file_addr);
 
     if (result >= 0) {
         // Success: update end-of-load pointers and return with carry clear
