@@ -7,7 +7,7 @@
 #include "m6502/m6502.h"
 
 // ---------------------------------------------------------------------------
-// Temporización PAL (C64 PAL: 985248 Hz, 312 líneas, 63 ciclos/línea)
+// Temporizaciï¿½n PAL (C64 PAL: 985248 Hz, 312 lï¿½neas, 63 ciclos/lï¿½nea)
 // ---------------------------------------------------------------------------
 #define C64_CPU_FREQ        985248
 #define C64_LINES_PER_FRAME 312
@@ -116,9 +116,9 @@ typedef struct {
     uint8_t  version;       // 0 o 1
     bool     playing;
     int32_t  pulse_cycles;  // ciclos restantes del pulso actual
-    bool     level;         // nivel actual de la señal
+    bool     level;         // nivel actual de la seï¿½al
     bool     motor;         // motor encendido (bit 5 de $0001)
-    bool     button;        // botón PLAY pulsado
+    bool     button;        // botï¿½n PLAY pulsado
 } C64Tape;
 
 // ---------------------------------------------------------------------------
@@ -155,16 +155,16 @@ typedef struct {
 
     // VIC-II (6569 PAL)
     uint8_t vic_regs[64];
-    uint16_t vic_raster;         // línea de raster actual
-    uint16_t vic_raster_irq;     // línea para generar IRQ
-    int      vic_cycle;          // ciclo dentro de la línea (0..62)
+    uint16_t vic_raster;         // lï¿½nea de raster actual
+    uint16_t vic_raster_irq;     // lï¿½nea para generar IRQ
+    int      vic_cycle;          // ciclo dentro de la lï¿½nea (0..62)
     bool     vic_irq_raster;     // IRQ de raster pendiente
     bool     vic_irq_enabled;    // IRQ de raster habilitada
-    bool     vic_display_active; // área de display activa
+    bool     vic_display_active; // ï¿½rea de display activa
     uint16_t vic_vc;             // video counter
     uint16_t vic_vc_base;        // video counter base
     uint8_t  vic_rc;             // row counter (0-7)
-    bool     vic_bad_line;       // línea actual es bad line
+    bool     vic_bad_line;       // lï¿½nea actual es bad line
     uint16_t vic_char_base;      // base de character memory
     uint16_t vic_screen_base;    // base de screen memory
     uint16_t vic_bitmap_base;    // base de bitmap memory
@@ -199,13 +199,13 @@ typedef struct {
     // CIA 1 & 2
     CIA cia[2];
 
-    // Teclado (matriz 8×8)
+    // Teclado (matriz 8ï¿½8)
     uint8_t keyboard_matrix[8]; // filas, bits activos = 0 (pulsado)
 
     // Joystick port 2 (bits activos = 0)
     uint8_t joystick;
 
-    // SDL vídeo
+    // SDL vï¿½deo
     SDL_Window*   window;
     SDL_Renderer* renderer;
     SDL_Texture*  texture;
@@ -225,10 +225,15 @@ typedef struct {
     // Estado
     bool quit;
     bool turbo_mode;
+    // PRG pendiente (carga diferida para que BASIC se inicialice primero)
+    char pending_prg[512];
+    bool prg_pending;
+	char pending_tap[512];
+    bool tap_pending;
     int  frame_counter;
 } C64;
 
-// Prototipos públicos
+// Prototipos pï¿½blicos
 void c64_init(C64* c);
 void c64_destroy(C64* c);
 int  c64_load_roms(C64* c, const char* dir);

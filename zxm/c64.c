@@ -242,7 +242,7 @@ static uint8_t cia_read(C64* c, int idx, uint8_t reg) {
         return (ci->pra | ~ci->ddra);
     case 0x01: // PRB
         if (idx == 0) {
-            // CIA1 PRB: keyboard row read
+            // CIA1 PRB: keyboard row read only - NO tape signal here
             uint8_t val = 0xFF;
             uint8_t cols = ~ci->pra;
             for (int i = 0; i < 8; i++) {
@@ -349,10 +349,26 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
     // $0000-$0001: 6510 I/O port
     if (addr == 0x0000) return c->port_ddr;
     if (addr == 0x0001) {
-        uint8_t val = (c->port_dat & c->port_ddr) | (~c->port_ddr & 0x17);
-        // Bit 4: cassette button (0=pressed)
-        if (c->tape.button)
-            val &= ~0x10;
+        // 6510 port: output bits from port_dat, input bits float high.
+        // Bit assignments: 0=LORAM, 1=HIRAM, 2=CHAREN, 3=tape WR, 4=tape SENSE/READ, 5=tape motor
+        uint8_t input_mask = ~c->port_ddr;
+        uint8_t val = (c->port_dat & c->port_ddr) | (0xFF & input_mask);
+
+        // Bit 4 (input when DDR bit4=0): cassette READ line.
+        // - When tape is stopped/button not pressed: line floats high (1)
+        // - When PLAY pressed (button=true): KERNAL uses this to detect button,
+        //   then the actual tape signal toggles this bit as pulses stream in.
+        if (input_mask & 0x10) {
+            if (!c->tape.button) {
+                val |= 0x10;  // no button pressed → high
+            } else {
+                // Button pressed: expose the actual tape data signal level
+                if (c->tape.level)
+                    val |= 0x10;
+                else
+                    val &= ~0x10;
+            }
+        }
         return val;
     }
 
@@ -721,35 +737,208 @@ static int tap_load(C64* c, const char* path) {
 }
 
 static void tap_update(C64* c, int cycles) {
-    if (!c->tape.playing || !c->tape.motor || !c->tape.data) return;
+    (void)cycles;
+    // Tape hardware emulation replaced by KERNAL trap (tap_kernal_trap).
+    // This function is kept as a stub.
+}
 
-    c->tape.pulse_cycles -= cycles;
-    if (c->tape.pulse_cycles <= 0) {
-        c->tape.level = !c->tape.level;
+// ---------------------------------------------------------------------------
+// TAP decoder helpers
+// ---------------------------------------------------------------------------
 
-        if (c->tape.pos >= c->tape.size) {
-            c->tape.playing = false;
-            return;
+// Read next pulse length in TAP units from tape buffer.
+// Returns -1 on end of tape.
+static int tap_read_pulse(C64* c) {
+    if (c->tape.pos >= c->tape.size) return -1;
+    uint8_t b = c->tape.data[c->tape.pos++];
+    if (b != 0) return (int)b;
+    // Extended pulse (version 1)
+    if (c->tape.version == 0) return 256;
+    if (c->tape.pos + 3 > c->tape.size) return -1;
+    int len = (int)c->tape.data[c->tape.pos]
+            | ((int)c->tape.data[c->tape.pos+1] << 8)
+            | ((int)c->tape.data[c->tape.pos+2] << 16);
+    c->tape.pos += 3;
+    return len;
+}
+
+// Decode one byte from the TAP bitstream using CBM encoding.
+// Each byte = long-pulse marker + 8 bits (LSB first) + 1 parity bit.
+// Each bit = two pulses: (short,long)=0  (long,short)=1
+// Thresholds in TAP units (×8 = CPU cycles):
+//   short  ≤ 0x3C  (≈384–480 cycles)
+//   medium ≤ 0x50  (≈480–640 cycles)  — treated as long for bit decode
+//   long   > 0x3C
+// Returns decoded byte or -1 on error/EOF.
+static int tap_decode_byte(C64* c) {
+    const int SHORT_MAX = 0x3C;
+
+    // Hunt for the byte-start marker: a long pulse
+    for (;;) {
+        int p = tap_read_pulse(c);
+        if (p < 0) return -1;
+        if (p > SHORT_MAX) break; // found long pulse = byte marker
+    }
+
+    uint8_t val = 0;
+    int parity = 1;
+    for (int bit = 0; bit < 8; bit++) {
+        int p1 = tap_read_pulse(c);
+        int p2 = tap_read_pulse(c);
+        if (p1 < 0 || p2 < 0) return -1;
+        int bv;
+        if (p1 <= SHORT_MAX && p2 > SHORT_MAX)       bv = 0; // short,long = 0
+        else if (p1 > SHORT_MAX && p2 <= SHORT_MAX)  bv = 1; // long,short = 1
+        else return -1; // invalid
+        val |= (uint8_t)(bv << bit);
+        parity ^= bv;
+    }
+    // Parity bit (ignore errors, just consume it)
+    tap_read_pulse(c);
+    tap_read_pulse(c);
+    return (int)val;
+}
+
+// KERNAL trap for tape load: intercept $F4A5 (tape LOAD entry, PAL KERNAL).
+// Decodes the TAP bitstream and loads the first program block into RAM.
+static void tap_kernal_trap(C64* c) {
+    if (!c->tape.data || !c->tape.playing) return;
+    // Trap at $F4A5 (PAL KERNAL 901227-03 tape load) and $F533 (secondary entry)
+    if (c->cpu.pc != 0xF4A5 && c->cpu.pc != 0xF533) return;
+
+    uint32_t saved_pos = c->tape.pos;
+    c->tape.pos = 0; // decode from start
+
+    // Skip leader (long run of short pulses) and find sync sequence.
+    // CBM sync sequence for a data block: $89 $88 $87 $86 $85 $84 $83 $82 $81
+    // followed by data marker $FF or $55.
+
+    uint8_t fifo[16];
+    int fifo_len = 0;
+    int bytes_read = 0;
+    int sync_start = -1;
+
+    // Read bytes until we find the sync sequence or run out
+    while (bytes_read < 50000) {
+        int b = tap_decode_byte(c);
+        if (b < 0) break;
+        bytes_read++;
+
+        // Shift into fifo
+        if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
+        else {
+            memmove(fifo, fifo+1, 15);
+            fifo[15] = (uint8_t)b;
         }
 
-        uint8_t b = c->tape.data[c->tape.pos++];
-        if (b == 0) {
-            if (c->tape.version == 0) {
-                c->tape.pulse_cycles = 256 * 8;
-            } else {
-                if (c->tape.pos + 2 < c->tape.size) {
-                    c->tape.pulse_cycles = (int32_t)c->tape.data[c->tape.pos] |
-                                           ((int32_t)c->tape.data[c->tape.pos + 1] << 8) |
-                                           ((int32_t)c->tape.data[c->tape.pos + 2] << 16);
-                    c->tape.pos += 3;
-                } else {
-                    c->tape.playing = false;
-                }
+        // Check for sync: last 9 bytes = $89 $88 ... $81
+        if (fifo_len >= 9) {
+            int base = fifo_len >= 16 ? 7 : fifo_len - 9;
+            bool found = true;
+            for (int i = 0; i < 9; i++) {
+                if (fifo[base+i] != (uint8_t)(0x89 - i)) { found = false; break; }
             }
-        } else {
-            c->tape.pulse_cycles = (int32_t)b * 8;
+            if (found) { sync_start = 1; break; }
         }
     }
+
+    if (sync_start < 0) {
+        c->tape.pos = saved_pos;
+        return; // no valid tape data
+    }
+
+    // Skip data marker ($FF or $55)
+    int marker = tap_decode_byte(c);
+    if (marker != 0xFF && marker != 0x55) {
+        c->tape.pos = saved_pos;
+        return;
+    }
+
+    // Read block header (192 bytes for CBM programs):
+    // [0]     = block type (0x01=non-relocatable, 0x03=relocatable)
+    // [1..2]  = start address (lo, hi)
+    // [3..4]  = end address (lo, hi)
+    // [5..20] = filename (16 bytes, padded with $20)
+    // [21..191] = rest of header (can ignore)
+    uint8_t hdr[21];
+    for (int i = 0; i < 21; i++) {
+        int b = tap_decode_byte(c);
+        if (b < 0) { c->tape.pos = saved_pos; return; }
+        hdr[i] = (uint8_t)b;
+    }
+    // Skip rest of header block (up to 192 bytes total)
+    for (int i = 21; i < 192; i++) {
+        if (tap_decode_byte(c) < 0) break;
+    }
+
+    uint8_t block_type = hdr[0];
+    if (block_type != 0x01 && block_type != 0x03) {
+        c->tape.pos = saved_pos;
+        return;
+    }
+
+    uint16_t load_addr = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
+    uint16_t end_addr  = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
+
+    // Now find the data block: second sync sequence + marker $FF
+    fifo_len = 0;
+    bytes_read = 0;
+    sync_start = -1;
+    while (bytes_read < 50000) {
+        int b = tap_decode_byte(c);
+        if (b < 0) break;
+        bytes_read++;
+        if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
+        else { memmove(fifo, fifo+1, 15); fifo[15] = (uint8_t)b; }
+        if (fifo_len >= 9) {
+            int base = fifo_len >= 16 ? 7 : fifo_len - 9;
+            bool found = true;
+            for (int i = 0; i < 9; i++) {
+                if (fifo[base+i] != (uint8_t)(0x89 - i)) { found = false; break; }
+            }
+            if (found) { sync_start = 1; break; }
+        }
+    }
+    if (sync_start < 0) { c->tape.pos = saved_pos; return; }
+    tap_decode_byte(c); // skip data marker
+
+    // Load data bytes into RAM
+    uint16_t ptr = load_addr;
+    while (ptr < end_addr) {
+        int b = tap_decode_byte(c);
+        if (b < 0) break;
+        c->ram[ptr++] = (uint8_t)b;
+    }
+
+    uint16_t actual_end = ptr;
+
+    // Update BASIC end-of-program pointers
+    if (load_addr == 0x0801) {
+        c->ram[0x2D] = (uint8_t)(actual_end & 0xFF);
+        c->ram[0x2E] = (uint8_t)(actual_end >> 8);
+        c->ram[0x2F] = c->ram[0x2D]; c->ram[0x30] = c->ram[0x2E];
+        c->ram[0x31] = c->ram[0x2D]; c->ram[0x32] = c->ram[0x2E];
+    }
+    c->ram[0xAE] = (uint8_t)(actual_end & 0xFF);
+    c->ram[0xAF] = (uint8_t)(actual_end >> 8);
+
+    // Return from KERNAL with success (carry clear)
+    c->cpu.cf = 0;
+    c->cpu.a  = 0;
+    c->cpu.x  = c->ram[0xAE];
+    c->cpu.y  = c->ram[0xAF];
+
+    // Pop JSR return address from stack
+    uint8_t lo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
+    uint8_t hi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
+    c->cpu.sp += 2;
+    c->cpu.pc  = (((uint16_t)hi << 8) | lo) + 1;
+
+    c->tape.playing = false;
+    c->tape.button  = false;
+
+    printf("TAP LOAD OK: type=$%02X addr=$%04X-$%04X (%d bytes)\n",
+           block_type, load_addr, actual_end, (int)(actual_end - load_addr));
 }
 
 // =============================================================================
@@ -759,9 +948,9 @@ static void tap_update(C64* c, int cycles) {
 static const int d64_sectors_per_track[36] = {
     0,
     21,21,21,21,21,21,21,21,21,21,21,21,21,21,21,21,21, // tracks 1-17
-    19,19,19,19,19,19,                                     // tracks 18-23
-    18,18,18,18,18,18,                                     // tracks 24-29
-    17,17,17,17,17                                         // tracks 30-34
+    19,19,19,19,19,19,19,                                  // tracks 18-24
+    18,18,18,18,18,18,                                     // tracks 25-30
+    17,17,17,17,17                                         // tracks 31-35
 };
 
 static int d64_track_offset(int track) {
@@ -781,6 +970,15 @@ static uint8_t* d64_get_sector(C64* c, int track, int sector) {
 
 static int d64_load_file(C64* c, const char* filename, int namelen, uint16_t* load_addr, bool use_file_addr) {
     // Search directory (track 18, starting at sector 1)
+    // D64 directory sector layout:
+    //   byte 0   = next dir track  (0 = last sector)
+    //   byte 1   = next dir sector
+    //   bytes 2+ = 8 directory entries, each 32 bytes:
+    //     [0]    = file type ($00=scratched, bit7=closed, bits0-2=type)
+    //     [1]    = file start track
+    //     [2]    = file start sector
+    //     [3-18] = filename (padded with $A0)
+    //     ...
     int dir_track = D64_BAM_TRACK;
     int dir_sector = 1;
 
@@ -789,115 +987,132 @@ static int d64_load_file(C64* c, const char* filename, int namelen, uint16_t* lo
         if (!sector) return -1;
 
         for (int entry = 0; entry < 8; entry++) {
-            uint8_t* e = sector + entry * 32;
-            if (entry == 0 && dir_sector == 1)
-                e = sector; // first entry starts at beginning in sector 1... actually offset 0 has the link
-            e = sector + 2 + entry * 32; // directory entries start at offset 2 in sector
+            uint8_t* e = sector + 2 + entry * 32; // entries start at byte 2
 
-            if (entry == 0 && e >= sector + 256) break;
+            // Skip scratched/empty entries (type==0 means scratched)
+            if ((e[0] & 0x07) == 0) continue;
 
-            uint8_t file_type = e[0] & 0x07;
-            if (file_type == 0) continue; // deleted
-
-            // Compare filename (padded with $A0)
+            // Compare filename (C64 names padded with $A0)
+            if (namelen == 0) continue;
             bool match = true;
             for (int i = 0; i < namelen && i < 16; i++) {
-                uint8_t fc = e[3 + i]; // filename at offset 3-18
                 uint8_t rc = (uint8_t)filename[i];
-                if (rc == '*') { match = true; break; } // wildcard
+                if (rc == '*') { match = true; break; } // wildcard stops here
+                uint8_t fc = e[3 + i]; // filename at offset 3..18 within entry
                 if (fc != rc) { match = false; break; }
             }
             if (!match) continue;
 
             // Found file: load it following the track/sector chain
-            int file_track = e[1];
+            int file_track  = e[1];
             int file_sector = e[2];
             bool first_sector = true;
             uint16_t addr = 0;
-            uint16_t ptr = 0;
+            uint16_t ptr  = 0;
 
             while (file_track != 0) {
                 uint8_t* data = d64_get_sector(c, file_track, file_sector);
                 if (!data) return -1;
 
-                int next_track = data[0];
+                int next_track  = data[0];
                 int next_sector = data[1];
-                int data_len = (next_track == 0) ? next_sector - 1 : 254;
+                // If next_track==0, next_sector is the index (1-based) of the last used byte
+                int data_len = (next_track == 0) ? (next_sector - 1) : 254;
 
                 if (first_sector) {
+                    // First two payload bytes are the load address
                     addr = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
                     if (use_file_addr)
                         *load_addr = addr;
                     ptr = *load_addr;
-                    for (int i = 4; i < data_len + 2; i++) {
+                    // Payload starts at byte 4, length is data_len-2 (we consumed 2 for addr)
+                    for (int i = 4; i < 2 + data_len; i++) {
                         if (ptr < 0xFFFF) c->ram[ptr++] = data[i];
                     }
                     first_sector = false;
                 } else {
-                    for (int i = 2; i < data_len + 2; i++) {
+                    for (int i = 2; i < 2 + data_len; i++) {
                         if (ptr < 0xFFFF) c->ram[ptr++] = data[i];
                     }
                 }
 
-                file_track = next_track;
+                file_track  = next_track;
                 file_sector = next_sector;
             }
 
-            return (int)(ptr - addr);
+            return (int)(ptr - *load_addr);
         }
 
-        dir_track = sector[0];
+        // Follow directory chain
+        dir_track  = sector[0];
         dir_sector = sector[1];
     }
     return -1; // not found
 }
 
 static void d64_kernal_trap(C64* c) {
-    // Trap LOAD routine at $FFD5
-    // On entry: A=0 (load), A=1 (verify), X/Y = device address
-    // SA (secondary address) at $B9, filename at ($BB),($BC), length at $B7
+    // Trap LOAD kernal routine at $FFD5.
+    // On LOAD entry the CPU just did JSR $FFD5; registers at this point:
+    //   $B7 = filename length
+    //   $BB/$BC = filename address (lo/hi)
+    //   $B8 = logical file number
+    //   $B9 = secondary address (0=load to BASIC ptr, 1=load to file addr)
+    //   $BA = device number (set by OPEN/LOAD statement)
+    //   A   = 0 (LOAD), 1 (VERIFY)
+    // We trap only device 8.
 
     if (c->cpu.pc != 0xFFD5 || !c->disk.loaded) return;
     if (c->cpu.a != 0) return; // only handle LOAD, not VERIFY
 
-    uint8_t device = c->cpu.x;
-    if (device != 8 && device != 1) return; // only disk (8) or tape-redirect
+    // Device comes from $BA (last used device number), not from X register
+    uint8_t device = c->ram[0xBA];
+    if (device != 8) return;
 
-    uint8_t namelen = c->ram[0xB7];
+    uint8_t namelen  = c->ram[0xB7];
     uint16_t nameaddr = (uint16_t)c->ram[0xBB] | ((uint16_t)c->ram[0xBC] << 8);
-    char filename[17];
-    for (int i = 0; i < namelen && i < 16; i++)
-        filename[i] = (char)c->ram[nameaddr + i];
-    filename[namelen < 16 ? namelen : 16] = 0;
 
-    uint8_t sa = c->ram[0xB9]; // secondary address
+    char filename[17];
+    int flen = (namelen < 16) ? namelen : 16;
+    for (int i = 0; i < flen; i++)
+        filename[i] = (char)c->ram[nameaddr + i];
+    filename[flen] = 0;
+
+    uint8_t  sa        = c->ram[0xB9]; // secondary address
+    bool use_file_addr = (sa != 0);    // sa==1: use address embedded in file
     uint16_t load_addr = 0;
 
-    if (sa == 0) {
-        // Load to address specified by BASIC (at $2B/$2C)
-        load_addr = (uint16_t)c->ram[0x2B] | ((uint16_t)c->ram[0x2C] << 8);
+    if (!use_file_addr) {
+        // Load to current BASIC pointer ($2D/$2E)
+        load_addr = (uint16_t)c->ram[0x2D] | ((uint16_t)c->ram[0x2E] << 8);
     }
 
-    bool use_file_addr = (sa != 0); // sa=0: load to BASIC area, sa=1: load to file address
-    int result = d64_load_file(c, filename, namelen, &load_addr, use_file_addr);
+    int result = d64_load_file(c, filename, flen, &load_addr, use_file_addr);
 
     if (result >= 0) {
-        // Success: set end address, clear carry (no error)
+        // Success: update end-of-load pointers and return with carry clear
         uint16_t end_addr = load_addr + (uint16_t)result;
-        c->cpu.x = (uint8_t)(end_addr & 0xFF);
-        c->cpu.y = (uint8_t)(end_addr >> 8);
-        c->ram[0xAE] = c->cpu.x;
-        c->ram[0xAF] = c->cpu.y;
+        c->ram[0xAE] = (uint8_t)(end_addr & 0xFF);
+        c->ram[0xAF] = (uint8_t)(end_addr >> 8);
+        c->cpu.x  = c->ram[0xAE];
+        c->cpu.y  = c->ram[0xAF];
         c->cpu.cf = 0; // no error
-        c->cpu.a = 0;
-
-        // Skip the KERNAL LOAD routine - return via RTS
-        uint8_t lo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
-        uint8_t hi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
-        c->cpu.sp += 2;
-        c->cpu.pc = ((uint16_t)hi << 8) | lo;
-        c->cpu.pc++; // RTS adds 1
+        c->cpu.a  = 0;
+        printf("D64 LOAD \"%s\" OK: $%04X-$%04X (%d bytes)\n",
+               filename, load_addr, end_addr, result);
+    } else {
+        // File not found: set carry and error code $04 (file not found)
+        c->cpu.cf = 1;
+        c->cpu.a  = 4;
+        c->ram[0x90] = 0x42; // ST: file not found
+        printf("D64 LOAD \"%s\" not found\n", filename);
     }
+
+    // Skip the real KERNAL LOAD routine by popping the return address
+    // (JSR pushed PC-1, so the return address on stack is the instruction after JSR)
+    uint8_t lo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
+    uint8_t hi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
+    c->cpu.sp += 2;
+    c->cpu.pc = (((uint16_t)hi << 8) | lo) + 1; // RTS semantics: +1
 }
 
 // =============================================================================
@@ -1036,7 +1251,7 @@ int c64_load_tap(C64* c, const char* path) {
 
 typedef struct {
     SDL_Scancode key;
-    int row, col;
+    int col, row;
 } C64KeyMap;
 
 static const C64KeyMap keymap[] = {
@@ -1238,6 +1453,12 @@ void c64_destroy(C64* c) {
 // =============================================================================
 
 void c64_run_frame(C64* c) {
+    // Deferred PRG load: wait for BASIC to finish initialization
+    if (c->prg_pending && c->frame_counter >= 200) {
+        c64_load_prg(c, c->pending_prg);
+        c->prg_pending = false;
+    }
+
     int cycles_done = 0;
     float sample_accum = (float)C64_CPU_FREQ / (float)C64_AUDIO_RATE;
     float next_sample_at = 0.0f;
@@ -1249,6 +1470,10 @@ void c64_run_frame(C64* c) {
         if (c->disk.loaded)
             d64_kernal_trap(c);
 
+        // KERNAL trap for TAP loading
+        if (c->tape.data && c->tape.playing)
+            tap_kernal_trap(c);
+
         // Execute one CPU instruction
         unsigned long cyc_before = c->cpu.cyc;
         m6502_step(&c->cpu);
@@ -1258,7 +1483,10 @@ void c64_run_frame(C64* c) {
         cia_step(&c->cia[0], elapsed);
         cia_step(&c->cia[1], elapsed);
 
-        // CIA1 IRQ -> CPU IRQ
+        // Tape update - must happen before CIA IRQ check so FLAG events are seen immediately
+        tap_update(c, elapsed);
+
+        // CIA1 IRQ -> CPU IRQ (timers + FLAG from tape)
         if (c->cia[0].icr & c->cia[0].icr_mask)
             m6502_gen_irq(&c->cpu);
 
@@ -1287,9 +1515,6 @@ void c64_run_frame(C64* c) {
                     m6502_gen_irq(&c->cpu);
             }
         }
-
-        // Tape update
-        tap_update(c, elapsed);
 
         // Audio sampling
         float pos_f = (float)cycles_done;
@@ -1365,8 +1590,10 @@ int main(int argc, char* argv[]) {
     // Load files from command line
     for (int i = 1; i < argc; i++) {
         if (ext_eq(argv[i], ".prg")) {
-            c64_load_prg(&c64, argv[i]);
-            printf("PRG cargado. Escribe RUN para ejecutar.\n");
+            strncpy(c64.pending_prg, argv[i], sizeof(c64.pending_prg) - 1);
+            c64.pending_prg[sizeof(c64.pending_prg) - 1] = '\0';
+            c64.prg_pending = true;
+            printf("PRG pendiente. Escribe RUN para ejecutar.\n");
         } else if (ext_eq(argv[i], ".d64")) {
             if (c64_load_d64(&c64, argv[i]) == 0)
                 printf("D64 montado: %s\n  LOAD\"$\",8 para directorio, LOAD\"*\",8,1 para primer programa\n", argv[i]);
