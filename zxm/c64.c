@@ -354,20 +354,14 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
         uint8_t input_mask = ~c->port_ddr;
         uint8_t val = (c->port_dat & c->port_ddr) | (0xFF & input_mask);
 
-        // Bit 4 (input when DDR bit4=0): cassette READ line.
-        // - When tape is stopped/button not pressed: line floats high (1)
-        // - When PLAY pressed (button=true): KERNAL uses this to detect button,
-        //   then the actual tape signal toggles this bit as pulses stream in.
+        // Bit 4 (input when DDR bit4=0): cassette SENSE line.
+        // Low when PLAY button is pressed, high when not.
+        // Tape data goes through CIA1 FLAG, not through this bit.
         if (input_mask & 0x10) {
-            if (!c->tape.button) {
-                val |= 0x10;  // no button pressed → high
-            } else {
-                // Button pressed: expose the actual tape data signal level
-                if (c->tape.level)
-                    val |= 0x10;
-                else
-                    val &= ~0x10;
-            }
+            if (c->tape.button)
+                val &= ~0x10;  // PLAY pressed -> sense low
+            else
+                val |= 0x10;   // not pressed -> high
         }
         return val;
     }
@@ -737,9 +731,35 @@ static int tap_load(C64* c, const char* path) {
 }
 
 static void tap_update(C64* c, int cycles) {
-    (void)cycles;
-    // Tape hardware emulation replaced by KERNAL trap (tap_kernal_trap).
-    // This function is kept as a stub.
+    if (!c->tape.data || !c->tape.playing || !c->tape.motor) return;
+
+    c->tape.pulse_cycles -= cycles;
+
+    while (c->tape.pulse_cycles <= 0 && c->tape.playing) {
+        c->tape.level = !c->tape.level;
+        if (!c->tape.level)
+            c->cia[0].icr |= 0x10; // falling edge -> CIA1 FLAG
+
+        if (c->tape.pos >= c->tape.size) {
+            c->tape.playing = false;
+            return;
+        }
+
+        uint8_t b = c->tape.data[c->tape.pos++];
+        if (b != 0) {
+            c->tape.pulse_cycles += (int32_t)b * 8;
+        } else if (c->tape.version == 0) {
+            c->tape.pulse_cycles += 256 * 8;
+        } else if (c->tape.pos + 3 <= c->tape.size) {
+            int32_t len = (int32_t)c->tape.data[c->tape.pos]
+                        | ((int32_t)c->tape.data[c->tape.pos+1] << 8)
+                        | ((int32_t)c->tape.data[c->tape.pos+2] << 16);
+            c->tape.pos += 3;
+            c->tape.pulse_cycles += len;
+        } else {
+            c->tape.playing = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +843,10 @@ static void tap_kernal_trap(C64* c) {
     // Read bytes until we find the sync sequence or run out
     while (bytes_read < 50000) {
         int b = tap_decode_byte(c);
-        if (b < 0) break;
+        if (b < 0) {
+            if (c->tape.pos >= c->tape.size) break;
+            continue; // skip invalid byte at pilot/data transition
+        }
         bytes_read++;
 
         // Shift into fifo
@@ -888,7 +911,10 @@ static void tap_kernal_trap(C64* c) {
     sync_start = -1;
     while (bytes_read < 50000) {
         int b = tap_decode_byte(c);
-        if (b < 0) break;
+        if (b < 0) {
+            if (c->tape.pos >= c->tape.size) break;
+            continue;
+        }
         bytes_read++;
         if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
         else { memmove(fifo, fifo+1, 15); fifo[15] = (uint8_t)b; }
@@ -1492,6 +1518,11 @@ static void c64_handle_key(C64* c, SDL_Scancode sc, bool pressed) {
         if (c->tape.data) {
             c->tape.playing = !c->tape.playing;
             c->tape.button = c->tape.playing;
+            if (c->tape.playing) {
+                c->tape.pos = 0;
+                c->tape.pulse_cycles = 0;
+                c->tape.level = false;
+            }
         }
         return;
     }
