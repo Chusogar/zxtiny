@@ -799,14 +799,16 @@ static int tap_decode_byte(C64* c) {
     return (int)val;
 }
 
-// KERNAL trap for tape load: intercept $F4A5 (tape LOAD entry, PAL KERNAL).
+// KERNAL trap for tape load: intercept $FFD5 (KERNAL LOAD entry) for device 1.
 // Decodes the TAP bitstream and loads the first program block into RAM.
 static void tap_kernal_trap(C64* c) {
-    if (!c->tape.data || !c->tape.playing) return;
-    // Trap at $F4A5 (PAL KERNAL 901227-03 tape load) and $F533 (secondary entry)
-    if (c->cpu.pc != 0xF4A5 && c->cpu.pc != 0xF533) return;
+    if (!c->tape.data) return;
+    if (c->cpu.pc != 0xFFD5) return;
+    if (c->cpu.a != 0) return; // only handle LOAD, not VERIFY
 
-    uint32_t saved_pos = c->tape.pos;
+    uint8_t device = c->ram[0xBA];
+    if (device != 1) return; // only tape device
+
     c->tape.pos = 0; // decode from start
 
     // Skip leader (long run of short pulses) and find sync sequence.
@@ -843,14 +845,14 @@ static void tap_kernal_trap(C64* c) {
     }
 
     if (sync_start < 0) {
-        c->tape.pos = saved_pos;
+        c->tape.pos = 0;
         return; // no valid tape data
     }
 
     // Skip data marker ($FF or $55)
     int marker = tap_decode_byte(c);
     if (marker != 0xFF && marker != 0x55) {
-        c->tape.pos = saved_pos;
+        c->tape.pos = 0;
         return;
     }
 
@@ -863,7 +865,7 @@ static void tap_kernal_trap(C64* c) {
     uint8_t hdr[21];
     for (int i = 0; i < 21; i++) {
         int b = tap_decode_byte(c);
-        if (b < 0) { c->tape.pos = saved_pos; return; }
+        if (b < 0) { c->tape.pos = 0; return; }
         hdr[i] = (uint8_t)b;
     }
     // Skip rest of header block (up to 192 bytes total)
@@ -873,7 +875,7 @@ static void tap_kernal_trap(C64* c) {
 
     uint8_t block_type = hdr[0];
     if (block_type != 0x01 && block_type != 0x03) {
-        c->tape.pos = saved_pos;
+        c->tape.pos = 0;
         return;
     }
 
@@ -899,7 +901,7 @@ static void tap_kernal_trap(C64* c) {
             if (found) { sync_start = 1; break; }
         }
     }
-    if (sync_start < 0) { c->tape.pos = saved_pos; return; }
+    if (sync_start < 0) { c->tape.pos = 0; return; }
     tap_decode_byte(c); // skip data marker
 
     // Load data bytes into RAM
@@ -1617,7 +1619,7 @@ void c64_run_frame(C64* c) {
             d64_kernal_trap(c);
 
         // KERNAL trap for TAP loading
-        if (c->tape.data && c->tape.playing)
+        if (c->tape.data)
             tap_kernal_trap(c);
 
         // Execute one CPU instruction
