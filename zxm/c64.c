@@ -766,7 +766,7 @@ static void tap_update(C64* c, int cycles) {
 // TAP decoder helpers for KERNAL trap (instant loading)
 // ---------------------------------------------------------------------------
 
-// Pulse classification thresholds (TAP byte values, ×8 = CPU cycles).
+// Pulse classification thresholds (TAP byte values, x8 = CPU cycles).
 // Calibrated from real TAP data: SHORT ~0x20-0x34, MEDIUM ~0x3F-0x48, LONG ~0x50-0x5C
 #define TAP_SHORT_MAX  0x3A   // <= this is SHORT
 #define TAP_LONG_MIN   0x4E   // >= this is LONG  (new-data marker)
@@ -888,8 +888,6 @@ static void tap_kernal_trap(C64* c) {
     if (data_type < 0) { c->tape.pos = saved_pos; return; }
 
     // --- Load data into RAM ---
-    // The first byte after sync is the block type marker, skip it.
-    // Load (end_addr - load_addr) bytes of program data.
     uint16_t ptr = load_addr;
     while (ptr < end_addr) {
         int b = tap_decode_byte(c);
