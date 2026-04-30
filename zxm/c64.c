@@ -1082,6 +1082,161 @@ static void d64_kernal_trap(C64* c) {
     c->cpu.pc = (((uint16_t)hi << 8) | lo) + 1; // RTS semantics: +1
 }
 
+/* ============================================================
+   Utilidades LE
+   ============================================================ */
+static inline uint16_t rd16le(const uint8_t* p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+static inline uint32_t rd32le(const uint8_t* p) {
+    return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
+}
+
+/* ============================================================
+   CARGA T64 (contenedor de PRG)
+   Formato del directorio T64 (cada entrada, 32 bytes, desde offset 0x40):
+     +0x00  1  tipo de entrada: 0=vacía, 1=stream normal, 3=snapshot
+     +0x01  1  tipo C64: 0x82=PRG, 0x81=SEQ, etc.
+     +0x02  2  dirección de inicio (LE)  ← load address real
+     +0x04  2  dirección de fin   (LE)   ← end address (exclusive)
+     +0x06  2  reservado
+     +0x08  4  offset dentro del fichero T64 hacia los datos del PRG (LE)
+     +0x0C  4  reservado
+     +0x10 16  nombre en PETSCII (relleno con 0x20 o 0xA0)
+   Los datos del PRG en el fichero NO llevan cabecera de 2 bytes:
+   la dirección de carga ya está en e[0x02-0x03] del directorio.
+   ============================================================ */
+int c64_load_t64(C64* c, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    /* Cabecera mínima: 32 bytes de tape record + 32 bytes de una entrada */
+    if (sz < 64) { fclose(f); return -1; }
+
+    uint8_t* buf = (uint8_t*)malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return -1;
+    }
+    fclose(f);
+
+    /* Validar firma T64 — los primeros 32 bytes son texto libre, pero
+       los ficheros bien formados empiezan con "C64" o "C64S". */
+    if (memcmp(buf, "C64", 3) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    /* Cabecera del tape record (offsets dentro del bloque de 32 bytes):
+         0x20  2  número máximo de entradas en el directorio
+         0x22  2  número de entradas usadas                        */
+    uint16_t max_entries  = rd16le(buf + 0x20);
+    uint16_t used_entries = rd16le(buf + 0x22);
+
+    /* Protección: si el fichero declara 0 entradas máximas, es corrupto;
+       usamos un límite razonable calculado a partir del tamaño del fichero. */
+    if (max_entries == 0 || max_entries > 8192)
+        max_entries = (uint16_t)((sz - 0x40) / 32);
+    /* used_entries puede estar en 0 en ficheros mal generados; en ese caso
+       iteramos hasta max_entries. */
+    uint16_t limit = (used_entries > 0 && used_entries <= max_entries)
+                     ? used_entries : max_entries;
+
+    const uint32_t dir_off = 0x40;
+    int found_idx = -1;
+
+    for (int i = 0; i < (int)limit; i++) {
+        /* Comprobamos que la entrada cabe en el buffer */
+        if (dir_off + (uint32_t)(i + 1) * 32 > (uint32_t)sz) break;
+
+        const uint8_t* e = buf + dir_off + (uint32_t)i * 32;
+
+        /* BUG 1 CORREGIDO: el tipo de entrada está en e[0], no en e[1].
+           e[0]==0 → entrada vacía; e[0]==1 → entrada normal (PRG/SEQ/…).
+           e[1] es el tipo C64 (0x82=PRG cerrado, 0x01=PRG de snapshot, …).
+           Aceptamos entradas con e[0] != 0 y e[1] conocido. */
+        if (e[0] == 0) continue;                  /* vacía */
+        uint8_t c64_type = e[1];
+        if (c64_type == 0) continue;              /* sin tipo válido */
+
+        /* BUG 2 CORREGIDO: la dirección de carga está en el directorio
+           (e+0x02), NO en los primeros 2 bytes de los datos del fichero.
+           Los datos del PRG en el T64 son contenido puro, sin cabecera. */
+        uint16_t load_addr      = rd16le(e + 0x02);
+        uint16_t end_addr_entry = rd16le(e + 0x04);  /* exclusivo */
+
+        /* BUG 3 CORREGIDO: el offset de datos está en e+0x08 (4 bytes LE).
+           Antes se leía con rd32le(e + 8) pero el índice era correcto;
+           lo que fallaba era asumir que buf[data_off] era una cabecera PRG
+           de 2 bytes y saltarla. Aquí NO saltamos nada. */
+        uint32_t data_off = rd32le(e + 0x08);
+
+        /* Validar que el offset apunta dentro del fichero */
+        if (data_off == 0 || data_off >= (uint32_t)sz) continue;
+
+        /* BUG 4 CORREGIDO: la longitud se calcula como end_addr - load_addr,
+           NO como end_addr - start_addr_del_directorio otra vez.
+           Además, en algunos T64 end_addr == 0 o end_addr <= load_addr
+           (ficheros mal generados); en ese caso calculamos la longitud
+           desde los datos disponibles en el fichero. */
+        uint32_t prg_len;
+        if (end_addr_entry > load_addr) {
+            prg_len = (uint32_t)(end_addr_entry - load_addr);
+        } else {
+            /* Fallback: usar los bytes disponibles desde data_off hasta el
+               final del fichero (típico en snaps o T64 mal escritos). */
+            prg_len = (uint32_t)sz - data_off;
+        }
+
+        /* Asegurarnos de no desbordarnos ni del buffer T64 ni de la RAM */
+        if (data_off + prg_len > (uint32_t)sz)
+            prg_len = (uint32_t)sz - data_off;
+        if ((uint32_t)load_addr + prg_len > 65536)
+            prg_len = 65536 - load_addr;
+        if (prg_len == 0) continue;
+
+        /* Copiar el PRG a la RAM del C64 */
+        memcpy(c->ram + load_addr, buf + data_off, prg_len);
+
+        uint16_t real_end = (uint16_t)(load_addr + prg_len);
+
+        /* Extraer nombre PETSCII → ASCII imprimible para el log */
+        char name[17] = {0};
+        for (int j = 0; j < 16; j++) {
+            uint8_t ch = e[0x10 + j];
+            if (ch == 0x00 || ch == 0xA0 || ch == 0x20) break;
+            /* Convertir PETSCII mayúsculas (0x41-0x5A) a ASCII */
+            if (ch >= 0x41 && ch <= 0x5A) ch = (uint8_t)(ch - 0x41 + 'A');
+            name[j] = (char)ch;
+        }
+
+        /* Actualizar punteros del sistema BASIC */
+        c->ram[0xAE] = (uint8_t)(real_end & 0xFF);
+        c->ram[0xAF] = (uint8_t)(real_end >> 8);
+
+        if (load_addr == 0x0801) {
+            /* Fin de programa BASIC y punteros de variables */
+            c->ram[0x2D] = c->ram[0xAE];
+            c->ram[0x2E] = c->ram[0xAF];
+            c->ram[0x2F] = c->ram[0xAE]; c->ram[0x30] = c->ram[0xAF]; /* VARTAB */
+            c->ram[0x31] = c->ram[0xAE]; c->ram[0x32] = c->ram[0xAF]; /* ARYTAB */
+            c->ram[0x33] = c->ram[0xAE]; c->ram[0x34] = c->ram[0xAF]; /* STREND */
+        }
+
+        printf("T64: '%s' cargado en $%04X-$%04X (%u bytes)\n",
+               name, load_addr, real_end, prg_len);
+        found_idx = i;
+        break; /* cargamos sólo el primer archivo encontrado */
+    }
+
+    free(buf);
+    return (found_idx >= 0) ? 0 : -1;
+}
+
 // =============================================================================
 // PRG - carga directa de programas
 // =============================================================================
@@ -1425,12 +1580,7 @@ void c64_destroy(C64* c) {
 // =============================================================================
 
 void c64_run_frame(C64* c) {
-    // Deferred PRG load: wait for BASIC to finish initialization
-    if (c->prg_pending && c->frame_counter >= 200) {
-        c64_load_prg(c, c->pending_prg);
-        c->prg_pending = false;
-    }
-
+    
     int cycles_done = 0;
     float sample_accum = (float)C64_CPU_FREQ / (float)C64_AUDIO_RATE;
     float next_sample_at = 0.0f;
@@ -1438,6 +1588,19 @@ void c64_run_frame(C64* c) {
     c->audio_pos = 0;
 
     while (cycles_done < C64_CYCLES_PER_FRAME) {
+
+		// Deferred PRG load: wait for BASIC to finish initialization
+		if (c->prg_pending && (c->cpu.pc == 0xa65c) /* BASIC end loading */ ) {
+			c64_load_prg(c, c->pending_prg);
+			c->prg_pending = false;
+		}
+
+		// Deferred T64 load: same delay so BASIC vectors are ready
+		if (c->t64_pending && (c->cpu.pc == 0xa65c) /* BASIC end loading */ ) {
+			c64_load_t64(c, c->pending_t64);
+			c->t64_pending = false;
+		}
+
         // KERNAL trap for D64 loading
         if (c->disk.loaded)
             d64_kernal_trap(c);
@@ -1543,7 +1706,7 @@ int main(int argc, char* argv[]) {
 
     // Load ROMs from current directory or specified path
     const char* rom_dir = ".";
-    if (argc > 1 && !ext_eq(argv[1], ".prg") && !ext_eq(argv[1], ".d64") && !ext_eq(argv[1], ".tap"))
+    if (argc > 1 && !ext_eq(argv[1], ".prg") && !ext_eq(argv[1], ".d64") && !ext_eq(argv[1], ".tap") && !ext_eq(argv[1], ".t64"))
         rom_dir = argv[1];
 
     if (c64_load_roms(&c64, rom_dir) != 0) {
@@ -1568,11 +1731,16 @@ int main(int argc, char* argv[]) {
         } else if (ext_eq(argv[i], ".tap")) {
             if (c64_load_tap(&c64, argv[i]) == 0)
                 printf("TAP cargado: %s\n  LOAD y pulsa F9 para reproducir\n", argv[i]);
+        }  else if (ext_eq(argv[i], ".t64")) {
+			strncpy(c64.pending_t64, argv[i], sizeof(c64.pending_t64) - 1);
+            c64.pending_t64[sizeof(c64.pending_t64) - 1] = '\0';
+            c64.t64_pending = true;
+            printf("T64 pendiente: %s\n  Se cargará automáticamente al arrancar.\n", argv[i]);
         }
     }
 
     if (argc <= 1) {
-        printf("Uso: %s [rom_dir] [archivo.prg|.d64|.tap]\n", argv[0]);
+        printf("Uso: %s [rom_dir] [archivo.prg|.d64|.tap|.t64]\n", argv[0]);
         printf("  ROMs necesarias en rom_dir: basic, kernal, chargen\n");
         printf("  F2  = velocidad maxima / normal\n");
         printf("  F9  = play/stop cinta\n");
