@@ -354,20 +354,14 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
         uint8_t input_mask = ~c->port_ddr;
         uint8_t val = (c->port_dat & c->port_ddr) | (0xFF & input_mask);
 
-        // Bit 4 (input when DDR bit4=0): cassette READ line.
-        // - When tape is stopped/button not pressed: line floats high (1)
-        // - When PLAY pressed (button=true): KERNAL uses this to detect button,
-        //   then the actual tape signal toggles this bit as pulses stream in.
+        // Bit 4 (input when DDR bit4=0): cassette SENSE line.
+        // Low when PLAY button is pressed, high when not.
+        // Tape data goes through CIA1 FLAG, not through this bit.
         if (input_mask & 0x10) {
-            if (!c->tape.button) {
-                val |= 0x10;  // no button pressed → high
-            } else {
-                // Button pressed: expose the actual tape data signal level
-                if (c->tape.level)
-                    val |= 0x10;
-                else
-                    val &= ~0x10;
-            }
+            if (c->tape.button)
+                val &= ~0x10;  // PLAY pressed -> sense low
+            else
+                val |= 0x10;   // not pressed -> high
         }
         return val;
     }
@@ -737,208 +731,35 @@ static int tap_load(C64* c, const char* path) {
 }
 
 static void tap_update(C64* c, int cycles) {
-    (void)cycles;
-    // Tape hardware emulation replaced by KERNAL trap (tap_kernal_trap).
-    // This function is kept as a stub.
-}
+    if (!c->tape.data || !c->tape.playing || !c->tape.motor) return;
 
-// ---------------------------------------------------------------------------
-// TAP decoder helpers
-// ---------------------------------------------------------------------------
+    c->tape.pulse_cycles -= cycles;
 
-// Read next pulse length in TAP units from tape buffer.
-// Returns -1 on end of tape.
-static int tap_read_pulse(C64* c) {
-    if (c->tape.pos >= c->tape.size) return -1;
-    uint8_t b = c->tape.data[c->tape.pos++];
-    if (b != 0) return (int)b;
-    // Extended pulse (version 1)
-    if (c->tape.version == 0) return 256;
-    if (c->tape.pos + 3 > c->tape.size) return -1;
-    int len = (int)c->tape.data[c->tape.pos]
-            | ((int)c->tape.data[c->tape.pos+1] << 8)
-            | ((int)c->tape.data[c->tape.pos+2] << 16);
-    c->tape.pos += 3;
-    return len;
-}
-
-// Decode one byte from the TAP bitstream using CBM encoding.
-// Each byte = long-pulse marker + 8 bits (LSB first) + 1 parity bit.
-// Each bit = two pulses: (short,long)=0  (long,short)=1
-// Thresholds in TAP units (×8 = CPU cycles):
-//   short  ≤ 0x3C  (≈384–480 cycles)
-//   medium ≤ 0x50  (≈480–640 cycles)  — treated as long for bit decode
-//   long   > 0x3C
-// Returns decoded byte or -1 on error/EOF.
-static int tap_decode_byte(C64* c) {
-    const int SHORT_MAX = 0x3C;
-
-    // Hunt for the byte-start marker: a long pulse
-    for (;;) {
-        int p = tap_read_pulse(c);
-        if (p < 0) return -1;
-        if (p > SHORT_MAX) break; // found long pulse = byte marker
-    }
-
-    uint8_t val = 0;
-    int parity = 1;
-    for (int bit = 0; bit < 8; bit++) {
-        int p1 = tap_read_pulse(c);
-        int p2 = tap_read_pulse(c);
-        if (p1 < 0 || p2 < 0) return -1;
-        int bv;
-        if (p1 <= SHORT_MAX && p2 > SHORT_MAX)       bv = 0; // short,long = 0
-        else if (p1 > SHORT_MAX && p2 <= SHORT_MAX)  bv = 1; // long,short = 1
-        else return -1; // invalid
-        val |= (uint8_t)(bv << bit);
-        parity ^= bv;
-    }
-    // Parity bit (ignore errors, just consume it)
-    tap_read_pulse(c);
-    tap_read_pulse(c);
-    return (int)val;
-}
-
-// KERNAL trap for tape load: intercept $F4A5 (tape LOAD entry, PAL KERNAL).
-// Decodes the TAP bitstream and loads the first program block into RAM.
-static void tap_kernal_trap(C64* c) {
-    if (!c->tape.data || !c->tape.playing) return;
-    // Trap at $F4A5 (PAL KERNAL 901227-03 tape load) and $F533 (secondary entry)
-    if (c->cpu.pc != 0xF4A5 && c->cpu.pc != 0xF533) return;
-
-    uint32_t saved_pos = c->tape.pos;
-    c->tape.pos = 0; // decode from start
-
-    // Skip leader (long run of short pulses) and find sync sequence.
-    // CBM sync sequence for a data block: $89 $88 $87 $86 $85 $84 $83 $82 $81
-    // followed by data marker $FF or $55.
-
-    uint8_t fifo[16];
-    int fifo_len = 0;
-    int bytes_read = 0;
-    int sync_start = -1;
-
-    // Read bytes until we find the sync sequence or run out
-    while (bytes_read < 50000) {
-        int b = tap_decode_byte(c);
-        if (b < 0) break;
-        bytes_read++;
-
-        // Shift into fifo
-        if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
-        else {
-            memmove(fifo, fifo+1, 15);
-            fifo[15] = (uint8_t)b;
+    // Each TAP byte = one complete pulse (full cycle between falling edges).
+    // Trigger CIA1 FLAG once per TAP byte so the KERNAL can measure pulse widths.
+    while (c->tape.pulse_cycles <= 0 && c->tape.playing) {
+        if (c->tape.pos >= c->tape.size) {
+            c->tape.playing = false;
+            return;
         }
 
-        // Check for sync: last 9 bytes = $89 $88 ... $81
-        if (fifo_len >= 9) {
-            int base = fifo_len >= 16 ? 7 : fifo_len - 9;
-            bool found = true;
-            for (int i = 0; i < 9; i++) {
-                if (fifo[base+i] != (uint8_t)(0x89 - i)) { found = false; break; }
-            }
-            if (found) { sync_start = 1; break; }
+        c->cia[0].icr |= 0x10; // CIA1 FLAG — tape data edge
+
+        uint8_t b = c->tape.data[c->tape.pos++];
+        if (b != 0) {
+            c->tape.pulse_cycles += (int32_t)b * 8;
+        } else if (c->tape.version == 0) {
+            c->tape.pulse_cycles += 256 * 8;
+        } else if (c->tape.pos + 3 <= c->tape.size) {
+            int32_t len = (int32_t)c->tape.data[c->tape.pos]
+                        | ((int32_t)c->tape.data[c->tape.pos+1] << 8)
+                        | ((int32_t)c->tape.data[c->tape.pos+2] << 16);
+            c->tape.pos += 3;
+            c->tape.pulse_cycles += len;
+        } else {
+            c->tape.playing = false;
         }
     }
-
-    if (sync_start < 0) {
-        c->tape.pos = saved_pos;
-        return; // no valid tape data
-    }
-
-    // Skip data marker ($FF or $55)
-    int marker = tap_decode_byte(c);
-    if (marker != 0xFF && marker != 0x55) {
-        c->tape.pos = saved_pos;
-        return;
-    }
-
-    // Read block header (192 bytes for CBM programs):
-    // [0]     = block type (0x01=non-relocatable, 0x03=relocatable)
-    // [1..2]  = start address (lo, hi)
-    // [3..4]  = end address (lo, hi)
-    // [5..20] = filename (16 bytes, padded with $20)
-    // [21..191] = rest of header (can ignore)
-    uint8_t hdr[21];
-    for (int i = 0; i < 21; i++) {
-        int b = tap_decode_byte(c);
-        if (b < 0) { c->tape.pos = saved_pos; return; }
-        hdr[i] = (uint8_t)b;
-    }
-    // Skip rest of header block (up to 192 bytes total)
-    for (int i = 21; i < 192; i++) {
-        if (tap_decode_byte(c) < 0) break;
-    }
-
-    uint8_t block_type = hdr[0];
-    if (block_type != 0x01 && block_type != 0x03) {
-        c->tape.pos = saved_pos;
-        return;
-    }
-
-    uint16_t load_addr = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
-    uint16_t end_addr  = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
-
-    // Now find the data block: second sync sequence + marker $FF
-    fifo_len = 0;
-    bytes_read = 0;
-    sync_start = -1;
-    while (bytes_read < 50000) {
-        int b = tap_decode_byte(c);
-        if (b < 0) break;
-        bytes_read++;
-        if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
-        else { memmove(fifo, fifo+1, 15); fifo[15] = (uint8_t)b; }
-        if (fifo_len >= 9) {
-            int base = fifo_len >= 16 ? 7 : fifo_len - 9;
-            bool found = true;
-            for (int i = 0; i < 9; i++) {
-                if (fifo[base+i] != (uint8_t)(0x89 - i)) { found = false; break; }
-            }
-            if (found) { sync_start = 1; break; }
-        }
-    }
-    if (sync_start < 0) { c->tape.pos = saved_pos; return; }
-    tap_decode_byte(c); // skip data marker
-
-    // Load data bytes into RAM
-    uint16_t ptr = load_addr;
-    while (ptr < end_addr) {
-        int b = tap_decode_byte(c);
-        if (b < 0) break;
-        c->ram[ptr++] = (uint8_t)b;
-    }
-
-    uint16_t actual_end = ptr;
-
-    // Update BASIC end-of-program pointers
-    if (load_addr == 0x0801) {
-        c->ram[0x2D] = (uint8_t)(actual_end & 0xFF);
-        c->ram[0x2E] = (uint8_t)(actual_end >> 8);
-        c->ram[0x2F] = c->ram[0x2D]; c->ram[0x30] = c->ram[0x2E];
-        c->ram[0x31] = c->ram[0x2D]; c->ram[0x32] = c->ram[0x2E];
-    }
-    c->ram[0xAE] = (uint8_t)(actual_end & 0xFF);
-    c->ram[0xAF] = (uint8_t)(actual_end >> 8);
-
-    // Return from KERNAL with success (carry clear)
-    c->cpu.cf = 0;
-    c->cpu.a  = 0;
-    c->cpu.x  = c->ram[0xAE];
-    c->cpu.y  = c->ram[0xAF];
-
-    // Pop JSR return address from stack
-    uint8_t lo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
-    uint8_t hi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
-    c->cpu.sp += 2;
-    c->cpu.pc  = (((uint16_t)hi << 8) | lo) + 1;
-
-    c->tape.playing = false;
-    c->tape.button  = false;
-
-    printf("TAP LOAD OK: type=$%02X addr=$%04X-$%04X (%d bytes)\n",
-           block_type, load_addr, actual_end, (int)(actual_end - load_addr));
 }
 
 // =============================================================================
@@ -1490,6 +1311,11 @@ static void c64_handle_key(C64* c, SDL_Scancode sc, bool pressed) {
         if (c->tape.data) {
             c->tape.playing = !c->tape.playing;
             c->tape.button = c->tape.playing;
+            if (c->tape.playing) {
+                c->tape.pos = 0;
+                c->tape.pulse_cycles = 0;
+                c->tape.level = false;
+            }
         }
         return;
     }
@@ -1615,10 +1441,6 @@ void c64_run_frame(C64* c) {
         // KERNAL trap for D64 loading
         if (c->disk.loaded)
             d64_kernal_trap(c);
-
-        // KERNAL trap for TAP loading
-        if (c->tape.data && c->tape.playing)
-            tap_kernal_trap(c);
 
         // Execute one CPU instruction
         unsigned long cyc_before = c->cpu.cyc;
