@@ -762,6 +762,168 @@ static void tap_update(C64* c, int cycles) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TAP decoder helpers for KERNAL trap (instant loading)
+// ---------------------------------------------------------------------------
+
+// Pulse classification thresholds (TAP byte values, ×8 = CPU cycles).
+// Calibrated from real TAP data: SHORT ~0x20-0x34, MEDIUM ~0x3F-0x48, LONG ~0x50-0x5C
+#define TAP_SHORT_MAX  0x3A   // <= this is SHORT
+#define TAP_LONG_MIN   0x4E   // >= this is LONG  (new-data marker)
+
+static int tap_read_pulse(C64* c) {
+    if (c->tape.pos >= c->tape.size) return -1;
+    uint8_t b = c->tape.data[c->tape.pos++];
+    if (b != 0) return (int)b;
+    if (c->tape.version == 0) return 256;
+    if (c->tape.pos + 3 > c->tape.size) return -1;
+    int len = (int)c->tape.data[c->tape.pos]
+            | ((int)c->tape.data[c->tape.pos+1] << 8)
+            | ((int)c->tape.data[c->tape.pos+2] << 16);
+    c->tape.pos += 3;
+    return len;
+}
+
+// Decode one byte from TAP using CBM encoding.
+// Each byte: LONG+MEDIUM marker (2 pulses) + 8 bit-pairs + parity pair = 20 pulses.
+// Bit 0 = SHORT+MEDIUM, Bit 1 = MEDIUM+SHORT.
+static int tap_decode_byte(C64* c) {
+    // Hunt for new-data marker: a LONG pulse (>= TAP_LONG_MIN)
+    for (;;) {
+        int p = tap_read_pulse(c);
+        if (p < 0) return -1;
+        if (p >= TAP_LONG_MIN) {
+            // Consume the following MEDIUM pulse (completes the 2-pulse marker)
+            int p2 = tap_read_pulse(c);
+            if (p2 < 0) return -1;
+            break;
+        }
+    }
+
+    uint8_t val = 0;
+    for (int bit = 0; bit < 8; bit++) {
+        int p1 = tap_read_pulse(c);
+        int p2 = tap_read_pulse(c);
+        if (p1 < 0 || p2 < 0) return -1;
+        int bv;
+        if (p1 <= TAP_SHORT_MAX && p2 > TAP_SHORT_MAX)
+            bv = 0;
+        else if (p1 > TAP_SHORT_MAX && p2 <= TAP_SHORT_MAX)
+            bv = 1;
+        else if (p1 < p2)  // lenient fallback: shorter first = 0
+            bv = 0;
+        else
+            bv = 1;
+        val |= (uint8_t)(bv << bit);
+    }
+    // Skip parity bit (2 pulses)
+    tap_read_pulse(c);
+    tap_read_pulse(c);
+    return (int)val;
+}
+
+// Find sync countdown ($89,$88,...,$81) in the TAP bitstream.
+static int tap_find_sync(C64* c) {
+    uint8_t fifo[16];
+    int fifo_len = 0;
+    int attempts = 0;
+    while (attempts < 200000) {
+        int b = tap_decode_byte(c);
+        if (b < 0) {
+            if (c->tape.pos >= c->tape.size) return -1;
+            continue;
+        }
+        attempts++;
+        if (fifo_len < 16) fifo[fifo_len++] = (uint8_t)b;
+        else { memmove(fifo, fifo+1, 15); fifo[15] = (uint8_t)b; }
+        if (fifo_len >= 9) {
+            int base = fifo_len >= 16 ? 7 : fifo_len - 9;
+            int ok = 1;
+            for (int i = 0; i < 9; i++) {
+                if (fifo[base+i] != (uint8_t)(0x89 - i)) { ok = 0; break; }
+            }
+            if (ok) return 0;
+        }
+    }
+    return -1;
+}
+
+// KERNAL trap: intercept $FFD5 (LOAD) for device 1 (tape).
+// Decodes the TAP bitstream and loads the first program block into RAM.
+static void tap_kernal_trap(C64* c) {
+    if (!c->tape.data) return;
+    if (c->cpu.pc != 0xFFD5) return;
+
+    if (c->cpu.a != 0) return; // only LOAD, not VERIFY
+
+    uint8_t device = c->ram[0xBA];
+    if (device != 1) return;
+
+    uint32_t saved_pos = c->tape.pos;
+    c->tape.pos = 0;
+
+    // --- Find and decode header block ---
+    if (tap_find_sync(c) < 0) { c->tape.pos = saved_pos; return; }
+
+    uint8_t hdr[192];
+    for (int i = 0; i < 192; i++) {
+        int b = tap_decode_byte(c);
+        if (b < 0) { c->tape.pos = saved_pos; return; }
+        hdr[i] = (uint8_t)b;
+    }
+
+    uint8_t block_type = hdr[0];
+    if (block_type != 0x01 && block_type != 0x03) {
+        c->tape.pos = saved_pos;
+        return;
+    }
+    uint16_t load_addr = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
+    uint16_t end_addr  = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
+
+    // --- Find data block (next sync after header) ---
+    if (tap_find_sync(c) < 0) { c->tape.pos = saved_pos; return; }
+
+    // Skip data block type marker (first byte after sync)
+    int data_type = tap_decode_byte(c);
+    if (data_type < 0) { c->tape.pos = saved_pos; return; }
+
+    // --- Load data into RAM ---
+    // The first byte after sync is the block type marker, skip it.
+    // Load (end_addr - load_addr) bytes of program data.
+    uint16_t ptr = load_addr;
+    while (ptr < end_addr) {
+        int b = tap_decode_byte(c);
+        if (b < 0) break;
+        c->ram[ptr++] = (uint8_t)b;
+    }
+
+    uint16_t actual_end = ptr;
+    // Update BASIC end-of-program pointers
+    if (load_addr == 0x0801) {
+        c->ram[0x2D] = (uint8_t)(actual_end & 0xFF);
+        c->ram[0x2E] = (uint8_t)(actual_end >> 8);
+        c->ram[0x2F] = c->ram[0x2D]; c->ram[0x30] = c->ram[0x2E];
+        c->ram[0x31] = c->ram[0x2D]; c->ram[0x32] = c->ram[0x2E];
+    }
+    c->ram[0xAE] = (uint8_t)(actual_end & 0xFF);
+    c->ram[0xAF] = (uint8_t)(actual_end >> 8);
+
+    // Return from KERNAL with success (carry clear)
+    c->cpu.cf = 0;
+    c->cpu.a  = 0;
+    c->cpu.x  = c->ram[0xAE];
+    c->cpu.y  = c->ram[0xAF];
+
+    // Pop JSR return address from stack
+    uint8_t lo = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 1)];
+    uint8_t hi = c->ram[0x0100 + (uint8_t)(c->cpu.sp + 2)];
+    c->cpu.sp += 2;
+    c->cpu.pc  = (((uint16_t)hi << 8) | lo) + 1;
+
+    c->tape.playing = false;
+    c->tape.button  = false;
+}
+
 // =============================================================================
 // D64 - soporte de disco mediante KERNAL trapping
 // =============================================================================
@@ -1438,7 +1600,9 @@ void c64_run_frame(C64* c) {
     c->audio_pos = 0;
 
     while (cycles_done < C64_CYCLES_PER_FRAME) {
-        // KERNAL trap for D64 loading
+        // KERNAL traps for instant loading
+        if (c->tape.data)
+            tap_kernal_trap(c);
         if (c->disk.loaded)
             d64_kernal_trap(c);
 
