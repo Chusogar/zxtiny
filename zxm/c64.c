@@ -1448,7 +1448,7 @@ static const C64KeyMap keymap[] = {
     { SDL_SCANCODE_SPACE,        7, 4 },
     { SDL_SCANCODE_LCTRL,        7, 5 }, // C= (Commodore key)
     { SDL_SCANCODE_Q,            7, 6 },
-    { SDL_SCANCODE_RCTRL,        7, 7 }, // RUN/STOP
+    { SDL_SCANCODE_F12,        7, 7 }, // RUN/STOP
     { 0, -1, -1 } // sentinel
 };
 
@@ -1478,11 +1478,11 @@ static void c64_handle_key(C64* c, SDL_Scancode sc, bool pressed) {
     // Joystick mapping (numpad or arrow alternatives when LALT held)
     // Using numpad: 8=up, 2=down, 4=left, 6=right, 5=fire
     switch (sc) {
-    case SDL_SCANCODE_KP_8: if (pressed) c->joystick &= ~0x01; else c->joystick |= 0x01; return;
-    case SDL_SCANCODE_KP_2: if (pressed) c->joystick &= ~0x02; else c->joystick |= 0x02; return;
-    case SDL_SCANCODE_KP_4: if (pressed) c->joystick &= ~0x04; else c->joystick |= 0x04; return;
-    case SDL_SCANCODE_KP_6: if (pressed) c->joystick &= ~0x08; else c->joystick |= 0x08; return;
-    case SDL_SCANCODE_KP_5:
+    case SDL_SCANCODE_UP: if (pressed) c->joystick &= ~0x01; else c->joystick |= 0x01; return;
+    case SDL_SCANCODE_DOWN: if (pressed) c->joystick &= ~0x02; else c->joystick |= 0x02; return;
+    case SDL_SCANCODE_LEFT: if (pressed) c->joystick &= ~0x04; else c->joystick |= 0x04; return;
+    case SDL_SCANCODE_RIGHT: if (pressed) c->joystick &= ~0x08; else c->joystick |= 0x08; return;
+    case SDL_SCANCODE_LCTRL:
     case SDL_SCANCODE_KP_0: if (pressed) c->joystick &= ~0x10; else c->joystick |= 0x10; return;
     default: break;
     }
@@ -1680,6 +1680,81 @@ void c64_render(C64* c) {
 }
 
 // =============================================================================
+// Utilidades de listado de contenido (Consola)
+// =============================================================================
+
+void list_d64_content(C64* c) {
+    if (!c->disk.loaded) return;
+    printf("\n--- CONTENIDO DISCO D64 ---\n");
+    
+    // El BAM está en 18/0, el directorio comienza en 18/1
+    int dir_track = 18, dir_sector = 1;
+    while (dir_track != 0) {
+        uint8_t* sec = d64_get_sector(c, dir_track, dir_sector);
+        if (!sec) break;
+        for (int entry = 0; entry < 8; entry++) {
+            uint8_t* e = sec + 2 + entry * 32;
+            if ((e[0] & 0x07) == 0) continue; // Entrada vacía o borrada
+
+            uint16_t blocks = (uint16_t)e[28] | ((uint16_t)e[29] << 8);
+            char fname[17] = {0};
+            for (int i = 0; i < 16; i++) {
+                if (e[3+i] == 0xA0) break;
+                fname[i] = (char)e[3+i];
+            }
+            static const char* ftypes[] = {"DEL","SEQ","PRG","USR","REL","???","???","???"};
+            printf("%3d \"%s\" %s\n", blocks, fname, ftypes[e[0] & 0x07]);
+        }
+        dir_track  = sec[0];
+        dir_sector = sec[1];
+    }
+    printf("---------------------------\n\n");
+}
+
+void list_t64_content(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    
+    uint8_t header[64];
+    if (fread(header, 1, 64, f) < 64) { fclose(f); return; }
+    
+    uint16_t used_entries = rd16le(header + 0x22);
+    printf("\n--- CONTENIDO CONTENEDOR T64 ---\n");
+    
+    for (int i = 0; i < used_entries; i++) {
+        uint8_t entry[32];
+        if (fread(entry, 1, 32, f) < 32) break;
+        if (entry[0] == 0) continue;
+
+        char name[17] = {0};
+        for (int j = 0; j < 16; j++) {
+            uint8_t ch = entry[0x10 + j];
+            if (ch == 0x00 || ch == 0xA0 || ch == 0x20) break;
+            name[j] = (char)ch;
+        }
+        uint16_t start = rd16le(entry + 0x02);
+        uint16_t end   = rd16le(entry + 0x04);
+        printf("Archivo: \"%s\" | Carga: $%04X | Fin: $%04X\n", name, start, end);
+    }
+    printf("--------------------------------\n\n");
+    fclose(f);
+}
+
+void list_tap_info(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t header[20];
+    if (fread(header, 1, 20, f) == 20) {
+        printf("\n--- INFORMACION CINTA TAP ---\n");
+        printf("Version: %d\n", header[12]);
+        uint32_t len = rd32le(header + 16);
+        printf("Tamaño de datos: %u bytes\n", len);
+        printf("-----------------------------\n\n");
+    }
+    fclose(f);
+}
+
+// =============================================================================
 // Utilidades
 // =============================================================================
 
@@ -1726,12 +1801,16 @@ int main(int argc, char* argv[]) {
             c64.prg_pending = true;
             printf("PRG pendiente. Escribe RUN para ejecutar.\n");
         } else if (ext_eq(argv[i], ".d64")) {
-            if (c64_load_d64(&c64, argv[i]) == 0)
+            if (c64_load_d64(&c64, argv[i]) == 0) {
+				list_d64_content(&c64); // Muestra el listado tras cargar el buffer
                 printf("D64 montado: %s\n  LOAD\"$\",8 para directorio, LOAD\"*\",8,1 para primer programa\n", argv[i]);
+			}
         } else if (ext_eq(argv[i], ".tap")) {
+			list_tap_info(argv[i]); // Muestra info antes de cargar
             if (c64_load_tap(&c64, argv[i]) == 0)
                 printf("TAP cargado: %s\n  LOAD y pulsa F9 para reproducir\n", argv[i]);
         }  else if (ext_eq(argv[i], ".t64")) {
+			list_t64_content(argv[i]); // Muestra listado antes de la carga diferida
 			strncpy(c64.pending_t64, argv[i], sizeof(c64.pending_t64) - 1);
             c64.pending_t64[sizeof(c64.pending_t64) - 1] = '\0';
             c64.t64_pending = true;
