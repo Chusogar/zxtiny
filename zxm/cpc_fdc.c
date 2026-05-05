@@ -270,6 +270,9 @@ void fdc_reset(FDC* fdc) {
     fdc->res_pos     = 0;
     fdc->res_len     = 0;
     fdc->irq_pending = false;
+    fdc->sint_pending = false;
+    fdc->sint_st0 = 0;
+    fdc->sint_pcn = 0;
     fdc->st0 = fdc->st1 = fdc->st2 = 0;
     fdc->srt = 8; fdc->hut = 8; fdc->hlt = 2; fdc->nd = true;
     // No resetear los discos montados
@@ -383,36 +386,47 @@ static void execute_command(FDC* fdc) {
             return;
 
         // ── 0x04 SENSE DRIVE STATUS ──────────────────────────────────────────
-        case 0x04:
-            fdc->st0 = (drive & 3) | (side ? FDC_ST0_HD : 0);
-            if (drv->disk.inserted && drv->motor_on) {
-                if (drv->current_track == 0) fdc->st0 |= 0x10; // Track 0
-            } else {
-                fdc->st0 |= FDC_ST0_NR;
+        case 0x04: {
+            // Devuelve ST3 (Status Register 3), no ST0
+            uint8_t st3 = (drive & 3) | (side ? 0x04 : 0);  // US0, US1, HD
+            if (drv->disk.inserted) {
+                if (drv->disk.num_sides > 1) st3 |= 0x08;    // TS (Two Side)
+                if (drv->current_track == 0) st3 |= 0x10;    // T0 (Track 0)
+                if (drv->motor_on && drv->ready) st3 |= 0x20; // RDY (Ready)
+                if (drv->disk.write_protected) st3 |= 0x40;   // WP
             }
-            fdc->res_buf[0] = fdc->st0;
+            fdc->res_buf[0] = st3;
             fdc->res_len = 1; fdc->res_pos = 0;
             fdc->phase = FDC_RESULT;
-            fdc->irq_pending = true;
             return;
+        }
 
         // ── 0x07 RECALIBRATE ─────────────────────────────────────────────────
         case 0x07:
             drv->current_track = 0;
-            fdc->st0 = FDC_ST0_SE | (drive & 3);
-            if (!drv->disk.inserted) fdc->st0 |= FDC_ST0_EC | FDC_ST0_NR;
+            fdc->sint_st0 = FDC_ST0_SE | (drive & 3);
+            if (!drv->disk.inserted) fdc->sint_st0 |= FDC_ST0_EC | FDC_ST0_NR;
+            fdc->sint_pcn = 0;
+            fdc->sint_pending = true;
             fdc->phase = FDC_IDLE;
             fdc->irq_pending = true;
             return;
 
         // ── 0x08 SENSE INTERRUPT STATUS ──────────────────────────────────────
         case 0x08:
-            // Retorna ST0 + PCN (Present Cylinder Number)
-            fdc->res_buf[0] = fdc->st0 | FDC_ST0_SE;
-            fdc->res_buf[1] = (uint8_t)drv->current_track;
-            fdc->res_len = 2; fdc->res_pos = 0;
+            if (fdc->sint_pending) {
+                // Devolver resultado guardado del último SEEK/RECALIBRATE
+                fdc->res_buf[0] = fdc->sint_st0;
+                fdc->res_buf[1] = fdc->sint_pcn;
+                fdc->res_len = 2; fdc->res_pos = 0;
+                fdc->sint_pending = false;
+                fdc->irq_pending = false;
+            } else {
+                // Sin interrupción pendiente → IC=10 (Invalid Command)
+                fdc->res_buf[0] = FDC_ST0_IC_IC;
+                fdc->res_len = 1; fdc->res_pos = 0;
+            }
             fdc->phase = FDC_RESULT;
-            // NO genera IRQ en sí mismo
             return;
 
         // ── 0x0F SEEK ────────────────────────────────────────────────────────
@@ -421,7 +435,9 @@ static void execute_command(FDC* fdc) {
             drv->current_track = ncn;
             if (drv->current_track >= (drv->disk.inserted ? drv->disk.num_tracks : 84))
                 drv->current_track = drv->disk.inserted ? drv->disk.num_tracks - 1 : 0;
-            fdc->st0 = FDC_ST0_SE | (drive & 3) | (side ? FDC_ST0_HD : 0);
+            fdc->sint_st0 = FDC_ST0_SE | (drive & 3) | (side ? FDC_ST0_HD : 0);
+            fdc->sint_pcn = (uint8_t)drv->current_track;
+            fdc->sint_pending = true;
             fdc->phase = FDC_IDLE;
             fdc->irq_pending = true;
             return;
@@ -509,9 +525,12 @@ static void execute_command(FDC* fdc) {
                 set_result_error(fdc, FDC_ST0_IC_AT);
                 return;
             }
-            // Devuelve el ID del primer sector de la pista
-            FDC_Sector* sec = &drv->disk.tracks[tidx].sectors[fdc->cur_sector % drv->disk.tracks[tidx].num_sectors];
-            fdc->st0 |= FDC_ST0_IC_OK;
+            FDC_Track* trk_id = &drv->disk.tracks[tidx];
+            int idx = fdc->cur_sector % trk_id->num_sectors;
+            FDC_Sector* sec = &trk_id->sectors[idx];
+            // Avanzar al siguiente sector para la próxima llamada
+            fdc->cur_sector = (idx + 1) % trk_id->num_sectors;
+            fdc->st0 = (fdc->st0 & 0x3F);  // IC = OK
             fdc->res_buf[0] = fdc->st0;
             fdc->res_buf[1] = fdc->st1;
             fdc->res_buf[2] = fdc->st2;
@@ -613,10 +632,9 @@ uint8_t fdc_read_status(FDC* fdc) {
             break;
     }
 
-    // Añadir bits de busy para las unidades en seek
-    for (int d = 0; d < FDC_MAX_DRIVES; d++)
-        if (fdc->drives[d].motor_on && fdc->drives[d].disk.inserted)
-            msr |= (FDC_MSR_DB0 << d);
+    // Los bits DB0/DB1 solo se activan durante un seek en curso.
+    // En esta implementación los seeks son instantáneos, así que
+    // los drive-busy bits nunca están activos cuando la CPU lee MSR.
 
     return msr;
 }
@@ -641,17 +659,35 @@ uint8_t fdc_read_data(FDC* fdc) {
         if (cmd == 0x06 || cmd == 0x02) {
             // READ DATA: devolver bytes del sector
             FDC_Sector* sec = current_exec_sector(fdc);
-            if (!sec || !sec->data || fdc->data_pos >= sec->data_len) {
-                // Fin del sector → resultado
-                fdc->st0 |= FDC_ST0_IC_OK;
+            if (!sec || !sec->data) {
+                // Sector no encontrado → error
+                fdc->st0 |= FDC_ST0_IC_AT;
+                fdc->st1 |= FDC_ST1_ND;
+                set_result_rw(fdc, sec);
+                return 0xFF;
+            }
+            if (fdc->data_pos >= sec->data_len) {
+                // Sector agotado sin avanzar – no debería ocurrir
+                fdc->st0 = (fdc->st0 & 0x3F);
                 set_result_rw(fdc, sec);
                 return 0xFF;
             }
             uint8_t byte = sec->data[fdc->data_pos++];
             if (fdc->data_pos >= sec->data_len) {
-                // Sector completo leído
-                fdc->st0 |= FDC_ST0_IC_OK;
-                set_result_rw(fdc, sec);
+                // Sector completo leído – ¿hay más sectores (multi-sector)?
+                uint8_t cur_r = fdc->cmd_buf[4];
+                uint8_t eot   = fdc->cmd_buf[6];
+                if (cur_r >= eot || cmd == 0x02) {
+                    // Último sector o READ TRACK → resultado normal
+                    fdc->st0 = (fdc->st0 & 0x3F);
+                    set_result_rw(fdc, sec);
+                } else {
+                    // Avanzar al siguiente sector
+                    fdc->cmd_buf[4] = cur_r + 1;
+                    fdc->data_pos = 0;
+                    // Si el siguiente sector no existe, la próxima
+                    // llamada a fdc_read_data() lo detectará.
+                }
             }
             return byte;
         }

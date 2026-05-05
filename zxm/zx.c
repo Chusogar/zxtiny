@@ -263,6 +263,7 @@ static inline void spectrum_apply_1ffd_force(ZXSpectrum* s, uint8_t val) {
     s->rom_page = plus3_rom_index(s->port_7ffd, s->port_1ffd);
 
     // Motor disquetera: bit3 -> control al FDC (bit0=A, bit1=B)
+    // En +3: bit3=1 activa motor, bit0 no afecta
     uint8_t motor = (val & 0x08) ? 0x03 : 0x00;
     fdc_motor_control(&s->fdc, motor);
 
@@ -274,6 +275,10 @@ static inline void spectrum_write_1ffd(ZXSpectrum* s, uint8_t val) {
     if (s->paging_lock) return;
     spectrum_apply_1ffd_force(s, val);
 }
+
+// Puertos 0x2FFD y 0x3FFD (+3) para control de FDC adicional
+static inline int is_2ffd(uint16_t port) { return (port == 0x2FFD); }
+static inline int is_3ffd(uint16_t port) { return (port == 0x3FFD); }
 
 // -----------------------------------------------------------------------------
 // Contención de memoria (aprox)
@@ -444,8 +449,6 @@ static inline int is_bffd(uint16_t port) {
 }
 
 static inline int is_1ffd(uint16_t port) { return (port == 0x1FFD); }
-static inline int is_2ffd(uint16_t port) { return (port == 0x2FFD); }
-static inline int is_3ffd(uint16_t port) { return (port == 0x3FFD); }
 
 static uint8_t port_in(z80* z, uint16_t port) {
     ZXSpectrum* s = (ZXSpectrum*)z->userdata;
@@ -474,7 +477,7 @@ static uint8_t port_in(z80* z, uint16_t port) {
         return s->ay.regs[s->ay.sel & 0x0F];
     }
 
-    // +3 FDC
+    // +3 FDC: puerto 0x2FFD = status, 0x3FFD = data
     if (s->model == ZX_MODEL_PLUS3) {
         if (is_2ffd(port)) return fdc_read_status(&s->fdc);
         if (is_3ffd(port)) return fdc_read_data(&s->fdc);
@@ -522,7 +525,7 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
         if (is_bffd(port)) { ay_write_reg(&s->ay, s->ay.sel, val); return; }
     }
 
-    // FDC data write
+    // FDC data write (0x3FFD)
     if (s->model == ZX_MODEL_PLUS3 && is_3ffd(port)) {
         fdc_write_data(&s->fdc, val);
         return;
@@ -1114,9 +1117,10 @@ void spectrum_run_frame(ZXSpectrum* s) {
                 break;
         }
 
-        // FDC
+        // FDC (+3): actualización cada ciclo
         if (s->model == ZX_MODEL_PLUS3) {
             fdc_tick(&s->fdc, total);
+            // Generar IRQ si el FDC lo requiere
             if (fdc_irq(&s->fdc)) {
                 z80_pulse_irq(&s->cpu, 0xFF);
             }
@@ -1245,7 +1249,8 @@ int main(int argc, char* argv[]) {
         if (spectrum_load_rom_plus3_set(&spec, "plus3-0.rom", "plus3-1.rom", "plus3-2.rom", "plus3-3.rom") != 0) {
             printf("Aviso: ROMs +3 no encontradas (plus3-0..3.rom). +3 arrancará en modo degradado.\n");
         }
-        // Estado inicial +3
+        // Estado inicial +3: inicializar FDC
+        fdc_reset(&spec.fdc);
         spectrum_apply_1ffd_force(&spec, 0x00);
         spectrum_apply_7ffd_force(&spec, 0x00);
     }
@@ -1276,12 +1281,14 @@ int main(int argc, char* argv[]) {
                 printf("[DSK] Ignorado: sólo disponible en --plus3\n");
                 continue;
             }
-            int d = (drive_to_mount < 2) ? drive_to_mount : 0;
-            if (fdc_load_dsk(&spec.fdc, d, file))
-                printf("[DSK] Disco montado en drive %c: %s\n", d ? 'B' : 'A', file);
-            else
-                printf("[DSK] ERROR montando DSK en drive %c: %s\n", d ? 'B' : 'A', file);
-            drive_to_mount++;
+            // Determinar unidad (máximo 2: A y B)
+            int drive = (drive_to_mount >= 2) ? 1 : drive_to_mount;
+            if (fdc_load_dsk(&spec.fdc, drive, file)) {
+                printf("[DSK] Disco montado en unidad %c: %s\n", drive ? 'B' : 'A', file);
+                drive_to_mount++;
+            } else {
+                printf("[DSK] ERROR montando disco en unidad %c: %s\n", drive ? 'B' : 'A', file);
+            }
         } else {
             printf("Archivo no reconocido: %s\n", file);
         }
