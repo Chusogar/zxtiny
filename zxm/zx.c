@@ -473,20 +473,6 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
         s->contention_extra += delay;
     }
 
-    // Beta 128 auto-paging (Pentagon/Scorpion):
-    // PC en 0x3D00-0x3DFF → activa TR-DOS ROM (sin importar qué ROM está paginada).
-    // PC >= 0x4000 con TR-DOS activo → vuelve a ROM normal.
-    if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) {
-        uint16_t pc = s->cpu.pc;
-        if ((pc & 0xFF00) == 0x3D00 && !s->beta_active && s->have_rom_beta) {
-            s->beta_active = true;
-            spectrum_update_memory_map(s);
-        } else if (pc >= 0x4000 && s->beta_active) {
-            s->beta_active = false;
-            spectrum_update_memory_map(s);
-        }
-    }
-
     return page_ptr(s, addr)[addr & 0x3FFF];
 }
 
@@ -1232,6 +1218,22 @@ void spectrum_run_frame(ZXSpectrum* s) {
     z80_pulse_irq(&s->cpu, 0xFF);
 
     while (cycles_done < TSTATES_PER_FRAME) {
+        // Beta 128 auto-paging (Pentagon/Scorpion):
+        // Se comprueba ANTES de z80_step para que la ROM correcta esté
+        // paginada en el momento del opcode fetch. Hacerlo en mem_read
+        // causaba desactivación espúrea por el pc ya incrementado.
+        if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
+            s->have_rom_beta) {
+            uint16_t pc = s->cpu.pc;
+            if ((pc & 0xFF00) == 0x3D00 && !s->beta_active) {
+                s->beta_active = true;
+                spectrum_update_memory_map(s);
+            } else if (pc >= 0x4000 && s->beta_active) {
+                s->beta_active = false;
+                spectrum_update_memory_map(s);
+            }
+        }
+
         s->contention_extra = 0;
         int base_cycles = (int)z80_step(&s->cpu);
         int total = base_cycles + s->contention_extra;
