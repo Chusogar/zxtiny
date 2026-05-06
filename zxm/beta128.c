@@ -536,10 +536,9 @@ bool beta128_load_trd(Beta128* beta, int drive, const char* path) {
         drv->disk.num_sides = 2;
     }
 
-    // Leer la geometría del sector 8 de la pista 0 (info del disco)
-    // Offset 0xE4 del disco = tipo de disco
-    if (sz >= 0xE7) {
-        uint8_t disk_type = drv->disk.data[0xE4];
+    // Leer geometría del sector 9 de pista 0, side 0 (offset 0x8E3 = tipo de disco)
+    if (sz >= 0x8E8) {
+        uint8_t disk_type = drv->disk.data[0x8E3];
         switch (disk_type) {
             case 0x16: drv->disk.num_tracks = 80; drv->disk.num_sides = 2; break;
             case 0x17: drv->disk.num_tracks = 40; drv->disk.num_sides = 2; break;
@@ -628,31 +627,31 @@ bool beta128_load_scl(Beta128* beta, int drive, const char* path) {
     // El sector 9 (offset 0x800) contiene información del disco
 
     int data_offset = header_size; // posición en el SCL donde empiezan los datos
-    int cur_track = 1;   // pista actual para datos (pista 0 es catálogo)
+    int cur_track = 0;   // datos empiezan en logical track 1 (track 0, side 1)
     int cur_sec = 1;     // sector actual (1-16)
-    int cur_side = 0;
+    int cur_side = 1;    // side 1 → logical track 1
 
     // Escribir entradas del catálogo
     for (int i = 0; i < num_files && i < 128; i++) {
         uint8_t* entry_src = &scl_data[9 + i * 14];
         uint8_t* entry_dst = &drv->disk.data[i * 16]; // catálogo en pista 0, side 0
 
-        // Copiar 8 bytes de nombre + 1 byte tipo + 2 bytes parámetros
+        // Copiar 14 bytes del SCL entry → 16 bytes del catálogo TR-DOS:
+        //   SCL [0..7]  → nombre, [8] tipo, [9..10] params, [11..12] longitud, [13] sectores
+        //   TRD [0..7]  → nombre, [8] tipo, [9..10] params, [11..12] longitud,
+        //       [13] sectores, [14] sector inicio (0-based), [15] pista lógica
         memcpy(entry_dst, entry_src, 8);   // nombre
-        entry_dst[8] = entry_src[8];       // tipo
-        // Parámetros (bytes 9-11 del SCL entry)
-        entry_dst[9]  = entry_src[9];
-        entry_dst[10] = entry_src[10];
-        entry_dst[11] = entry_src[11];
+        entry_dst[8]  = entry_src[8];      // tipo
+        entry_dst[9]  = entry_src[9];      // param low
+        entry_dst[10] = entry_src[10];     // param high
+        entry_dst[11] = entry_src[11];     // longitud low
+        entry_dst[12] = entry_src[12];     // longitud high
 
         uint8_t file_sectors = entry_src[13]; // longitud en sectores
 
-        // Sector y pista de inicio
         entry_dst[13] = file_sectors;
-        entry_dst[14] = (uint8_t)cur_sec;             // sector inicio (1-based, pero stored 0-based in some contexts)
-        // Ajuste: en TR-DOS, el sector de inicio es 0-based (0..15)
-        entry_dst[14] = (uint8_t)(cur_sec - 1);
-        entry_dst[15] = (uint8_t)(cur_track * 2 + cur_side); // logical track
+        entry_dst[14] = (uint8_t)(cur_sec - 1);                // sector inicio (0-based)
+        entry_dst[15] = (uint8_t)(cur_track * 2 + cur_side);   // pista lógica
 
         // Copiar datos del fichero al disco
         for (int s = 0; s < file_sectors; s++) {
@@ -676,33 +675,29 @@ bool beta128_load_scl(Beta128* beta, int drive, const char* path) {
         }
     }
 
-    // Escribir información del disco en sector 9 de la pista 0, side 0
-    // Offset 0x800 en el TRD
-    uint8_t* info = &drv->disk.data[0x800];
-    info[0x00] = 0x00; // Primer sector libre (0-based)
-    // El primer sector/track libre tras los datos escritos
-    info[0x01] = (uint8_t)(cur_sec - 1);  // sector libre (0-based)
-    info[0x02] = (uint8_t)(cur_track * 2 + cur_side); // logical track libre
+    // Sector 9 de pista 0, side 0 (offset 0x800): información del disco.
+    // Layout según especificación TR-DOS (offsets absolutos en TRD):
+    //   0x8E1: primer sector libre (0-based)
+    //   0x8E2: primera pista libre (logical track)
+    //   0x8E3: tipo de disco
+    //   0x8E4: número de ficheros
+    //   0x8E5-0x8E6: sectores libres (16-bit LE)
+    //   0x8E7: ID TR-DOS (0x10)
+    //   0x8F5-0x8FC: etiqueta del disco (8 bytes)
+    drv->disk.data[0x8E1] = (uint8_t)(cur_sec - 1);               // primer sector libre
+    drv->disk.data[0x8E2] = (uint8_t)(cur_track * 2 + cur_side);  // primera pista libre
+    drv->disk.data[0x8E3] = 0x16;                                  // 80 pistas, 2 caras
+    drv->disk.data[0x8E4] = num_files;
 
-    info[0x04] = num_files;
-    // Total de sectores libres
     int total_sectors = BETA_TRACKS_PER_SIDE * 2 * BETA_SECTORS_PER_TRACK;
     int used_sectors = ((cur_track * 2 + cur_side) * BETA_SECTORS_PER_TRACK) + (cur_sec - 1);
     int free_sectors = total_sectors - used_sectors;
-    info[0x05] = (uint8_t)(free_sectors & 0xFF);
-    info[0x06] = (uint8_t)((free_sectors >> 8) & 0xFF);
+    drv->disk.data[0x8E5] = (uint8_t)(free_sectors & 0xFF);
+    drv->disk.data[0x8E6] = (uint8_t)((free_sectors >> 8) & 0xFF);
 
-    info[0x07] = 0x10; // TR-DOS identificador
+    drv->disk.data[0x8E7] = 0x10;  // TR-DOS ID
 
-    // Bytes 0x08-0x0F: no usados
-    info[0x0D] = 0x00; // no usados
-
-    // Label del disco (bytes E0-E7 = offset 0x8E0)
-    uint8_t* label = &drv->disk.data[0x8E0];
-    memset(label, ' ', 8);
-
-    // Tipo de disco
-    drv->disk.data[0x8E4] = 0x16; // 80 pistas, 2 caras
+    memset(&drv->disk.data[0x8F5], ' ', 8);  // etiqueta del disco
 
     free(scl_data);
 
