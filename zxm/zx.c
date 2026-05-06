@@ -1219,23 +1219,35 @@ void spectrum_run_frame(ZXSpectrum* s) {
 
     while (cycles_done < TSTATES_PER_FRAME) {
         // Beta 128 auto-paging (Pentagon/Scorpion):
-        // Se comprueba ANTES de z80_step para que la ROM correcta esté
-        // paginada en el momento del opcode fetch. Hacerlo en mem_read
-        // causaba desactivación espúrea por el pc ya incrementado.
+        // Activación: se comprueba ANTES de z80_step para que la ROM
+        // correcta esté paginada en el momento del opcode fetch.
         if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
             s->have_rom_beta) {
             uint16_t pc = s->cpu.pc;
             if ((pc & 0xFF00) == 0x3D00 && !s->beta_active) {
                 s->beta_active = true;
                 spectrum_update_memory_map(s);
-            } else if (pc >= 0x4000 && s->beta_active) {
+            }
+        }
+
+        // Guardar estado pre-step para detectar interrupciones
+        uint16_t pc_before = s->cpu.pc;
+        uint8_t iff1_before = s->cpu.iff1;
+
+        s->contention_extra = 0;
+        int base_cycles = (int)z80_step(&s->cpu);
+
+        // Beta 128 auto-paging desactivación: DESPUÉS de z80_step.
+        // Solo desactivar si pc >= 0x4000 por ejecución real (JP/CALL/RET),
+        // NO por vectorización de interrupción (iff1 pasó de 1 a 0).
+        if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
+            s->have_rom_beta && s->beta_active && s->cpu.pc >= 0x4000) {
+            bool was_irq = (iff1_before && !s->cpu.iff1 && pc_before < 0x4000);
+            if (!was_irq) {
                 s->beta_active = false;
                 spectrum_update_memory_map(s);
             }
         }
-
-        s->contention_extra = 0;
-        int base_cycles = (int)z80_step(&s->cpu);
         int total = base_cycles + s->contention_extra;
 
         ula_video_main(s, total);
