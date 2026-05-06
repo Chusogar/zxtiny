@@ -473,13 +473,13 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
         s->contention_extra += delay;
     }
 
-    // Beta 128 auto-paging (Pentagon/Scorpion):
-    // Opcode fetch de 0x3D00-0x3DFF activa Beta ROM.
-    // Opcode fetch de 0x4000+ desactiva Beta ROM.
-    // Aproximamos detectando que addr == PC (opcode fetch).
+    // Beta 128 auto-paging (Pentagon/Scorpion) - matching YASE:
+    // Opcode fetch en 0x3D00-0x3DFF con ROM 1 (48K BASIC) paginada → activa TR-DOS.
+    // Opcode fetch en 0x4000+ con TR-DOS paginada → vuelve a ROM normal.
     if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) {
         if (addr == s->cpu.pc) {
-            if (!s->beta_active && (addr & 0xFF00) == 0x3D00 && s->have_rom_beta) {
+            if (!s->beta_active && (addr & 0xFF00) == 0x3D00 &&
+                s->have_rom_beta && s->rom_page == 1) {
                 s->beta_active = true;
                 spectrum_update_memory_map(s);
             } else if (s->beta_active && addr >= 0x4000) {
@@ -563,6 +563,13 @@ static uint8_t port_in(z80* z, uint16_t port) {
     if (s->model == ZX_MODEL_PLUS3) {
         if (is_2ffd(port)) return fdc_read_status(&s->fdc);
         if (is_3ffd(port)) return fdc_read_data(&s->fdc);
+    }
+
+    // Scorpion: lectura de puerto $BF pagina la ROM TR-DOS (matching YASE)
+    if (s->model == ZX_MODEL_SCORPION && (port & 0xFF) == 0xBF && !s->beta_active) {
+        s->beta_active = true;
+        spectrum_update_memory_map(s);
+        return (s->port_7ffd & 0x08) ? 0xFF : 0x7F;
     }
 
     // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
@@ -802,11 +809,11 @@ static void spectrum_set_model_defaults(ZXSpectrum* s, ZXModel model) {
         s->ula_ticks_per_frame  = 69888;
         s->ula_chars_per_line   = 56;
     } else if (model == ZX_MODEL_PENTAGON) {
-        // Pentagon: 224 T-states/line, 320 lines/frame = 71680
-        s->ula_tstates_per_line = 224;
-        s->ula_lines_per_frame  = 320;
+        // Pentagon: 228 T-states/line, 71680 T-states/frame (matching YASE)
+        s->ula_tstates_per_line = 228;
+        s->ula_lines_per_frame  = 314;
         s->ula_ticks_per_frame  = 71680;
-        s->ula_chars_per_line   = 56;
+        s->ula_chars_per_line   = 57;
     } else {
         // 128K, +3, Scorpion: 228 T-states/line, 311 lines
         s->ula_tstates_per_line = 228;
@@ -1347,8 +1354,13 @@ static void print_usage(const char* exe) {
     printf("  zx48.rom              (16KB)  ZX Spectrum 48K\n");
     printf("  zx128.rom             (32KB)  ZX Spectrum 128K\n");
     printf("  plus3-0..3.rom        (16KB)  ZX Spectrum +3\n");
-    printf("  trdos.rom             (16KB)  Beta 128 TR-DOS\n");
-    printf("  scorpion_service.rom  (16KB)  Scorpion Service Monitor\n");
+    printf("  128tr.rom             (16KB)  Pentagon 128K BASIC\n");
+    printf("  zx128_1.rom           (16KB)  Pentagon 48K BASIC\n");
+    printf("  trdos.rom             (16KB)  Pentagon TR-DOS\n");
+    printf("  scorp0.rom            (16KB)  Scorpion ROM 0 (128K editor)\n");
+    printf("  scorp1.rom            (16KB)  Scorpion ROM 1 (48K BASIC)\n");
+    printf("  scorp2.rom            (16KB)  Scorpion ROM 2 (Service monitor)\n");
+    printf("  scorp3.rom            (16KB)  Scorpion ROM 3 (TR-DOS)\n");
 
     printf("\nControles:\n");
     printf("  F1  -> iniciar cinta\n");
@@ -1388,8 +1400,7 @@ int main(int argc, char* argv[]) {
     if (spectrum_load_rom48(&spec, "zx48.rom") != 0)
         printf("Aviso: 'zx48.rom' no encontrada.\n");
 
-    if (model == ZX_MODEL_128K || model == ZX_MODEL_PLUS3 ||
-        model == ZX_MODEL_PENTAGON || model == ZX_MODEL_SCORPION) {
+    if (model == ZX_MODEL_128K || model == ZX_MODEL_PLUS3) {
         if (spectrum_load_rom128(&spec, "zx128.rom") != 0)
             printf("Aviso: 'zx128.rom' no encontrada (32KB).\n");
     }
@@ -1403,17 +1414,70 @@ int main(int argc, char* argv[]) {
         spectrum_apply_7ffd_force(&spec, 0x00);
     }
 
-    if (model == ZX_MODEL_PENTAGON || model == ZX_MODEL_SCORPION) {
+    // Pentagon: ROMs individuales matching YASE
+    //   128tr.rom   → ROM slot 0 (Pentagon 128K BASIC)
+    //   zx128_1.rom → ROM slot 1 (48K BASIC)
+    //   trdos.rom   → TR-DOS ROM
+    if (model == ZX_MODEL_PENTAGON) {
+        bool rom_ok = true;
+        if (load16k(spec.rom128[0], "128tr.rom") == 0) {
+            printf("[ROM] Pentagon 128: 128tr.rom\n");
+        } else {
+            printf("Aviso: '128tr.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (load16k(spec.rom128[1], "zx128_1.rom") == 0) {
+            printf("[ROM] Pentagon 48K BASIC: zx128_1.rom\n");
+        } else {
+            printf("Aviso: 'zx128_1.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (rom_ok) spec.have_rom128 = true;
+
         if (spectrum_load_rom_beta(&spec, "trdos.rom") != 0)
             printf("Aviso: 'trdos.rom' no encontrada. Sin soporte TR-DOS.\n");
         beta128_reset(&spec.beta);
         spectrum_apply_7ffd_force(&spec, 0x00);
     }
 
+    // Scorpion: ROMs individuales matching YASE
+    //   scorp0.rom → ROM slot 0 (128K editor)
+    //   scorp1.rom → ROM slot 1 (48K BASIC)
+    //   scorp2.rom → ROM slot 2 (Service monitor)
+    //   scorp3.rom → ROM slot 3 (TR-DOS)
     if (model == ZX_MODEL_SCORPION) {
-        if (spectrum_load_rom_scorpion_service(&spec, "scorpion_service.rom") != 0)
-            printf("Aviso: 'scorpion_service.rom' no encontrada.\n");
-        spectrum_apply_1ffd_force(&spec, 0x00);
+        bool rom_ok = true;
+        if (load16k(spec.rom128[0], "scorp0.rom") == 0) {
+            printf("[ROM] Scorpion ROM 0: scorp0.rom\n");
+        } else {
+            printf("Aviso: 'scorp0.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (load16k(spec.rom128[1], "scorp1.rom") == 0) {
+            printf("[ROM] Scorpion ROM 1: scorp1.rom\n");
+        } else {
+            printf("Aviso: 'scorp1.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (rom_ok) spec.have_rom128 = true;
+
+        if (load16k(spec.rom_scorpion_service, "scorp2.rom") == 0) {
+            spec.have_rom_scorpion_service = true;
+            printf("[ROM] Scorpion ROM 2 (service): scorp2.rom\n");
+        } else {
+            printf("Aviso: 'scorp2.rom' no encontrada.\n");
+        }
+        if (load16k(spec.rom_beta, "scorp3.rom") == 0) {
+            spec.have_rom_beta = true;
+            printf("[ROM] Scorpion ROM 3 (TR-DOS): scorp3.rom\n");
+        } else {
+            printf("Aviso: 'scorp3.rom' no encontrada.\n");
+        }
+        beta128_reset(&spec.beta);
+        spectrum_apply_7ffd_force(&spec, 0x00);
+        // Scorpion 1FFD init (sin lógica +3)
+        spec.port_1ffd = 0x00;
+        spectrum_update_memory_map(&spec);
     }
 
     // Montaje de discos DSK: A luego B
