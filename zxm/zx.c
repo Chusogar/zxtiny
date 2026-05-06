@@ -473,19 +473,17 @@ static uint8_t mem_read(void* userdata, uint16_t addr) {
         s->contention_extra += delay;
     }
 
-    // Beta 128 auto-paging (Pentagon/Scorpion) - matching YASE:
-    // Opcode fetch en 0x3D00-0x3DFF con ROM 1 (48K BASIC) paginada → activa TR-DOS.
-    // Opcode fetch en 0x4000+ con TR-DOS paginada → vuelve a ROM normal.
+    // Beta 128 auto-paging (Pentagon/Scorpion):
+    // PC en 0x3D00-0x3DFF → activa TR-DOS ROM (sin importar qué ROM está paginada).
+    // PC >= 0x4000 con TR-DOS activo → vuelve a ROM normal.
     if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) {
-        if (addr == s->cpu.pc) {
-            if (!s->beta_active && (addr & 0xFF00) == 0x3D00 &&
-                s->have_rom_beta && s->rom_page == 1) {
-                s->beta_active = true;
-                spectrum_update_memory_map(s);
-            } else if (s->beta_active && addr >= 0x4000) {
-                s->beta_active = false;
-                spectrum_update_memory_map(s);
-            }
+        uint16_t pc = s->cpu.pc;
+        if ((pc & 0xFF00) == 0x3D00 && !s->beta_active && s->have_rom_beta) {
+            s->beta_active = true;
+            spectrum_update_memory_map(s);
+        } else if (pc >= 0x4000 && s->beta_active) {
+            s->beta_active = false;
+            spectrum_update_memory_map(s);
         }
     }
 
