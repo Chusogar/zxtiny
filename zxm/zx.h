@@ -11,6 +11,9 @@
 // FDC (uPD765) reutilizado del core CPC
 #include "cpc_fdc.h"
 
+// Beta 128 Disk Interface (WD1793) para Pentagon/Scorpion
+#include "beta128.h"
+
 // ---------------------------------------------------------------------------
 // Temporización TAP (T-states a ~3.5 MHz)
 // ---------------------------------------------------------------------------
@@ -40,8 +43,8 @@
 #define ULA_FIRST_PAPER_LINE    64
 #define ULA_FIRST_VISIBLE_LINE  16
 
-// Máximo ticks/frame para dimensionar tablas (+3: 228*311 = 70908)
-#define ULA_MAX_TICKS_PER_FRAME 71136
+// Máximo ticks/frame para dimensionar tablas (Pentagon: 224*320 = 71680)
+#define ULA_MAX_TICKS_PER_FRAME 71680
 
 // CPU / Audio
 #define ZX_CPU_CLOCK_HZ 3500000
@@ -92,7 +95,9 @@ typedef enum {
 typedef enum {
     ZX_MODEL_48K = 0,
     ZX_MODEL_128K,
-    ZX_MODEL_PLUS3
+    ZX_MODEL_PLUS3,
+    ZX_MODEL_PENTAGON,
+    ZX_MODEL_SCORPION
 } ZXModel;
 
 // ---------------------------------------------------------------------------
@@ -153,8 +158,20 @@ typedef struct {
     uint8_t rom_plus3[4][16384];
     bool    have_rom_plus3;
 
-    // RAM 128K: 8 x 16K (bancos 0..7)
-    uint8_t ram[8][16384];
+    // ROM Beta 128 (TR-DOS): 1 x 16K
+    uint8_t rom_beta[16384];
+    bool    have_rom_beta;
+
+    // ROM Scorpion service: 1 x 16K
+    uint8_t rom_scorpion_service[16384];
+    bool    have_rom_scorpion_service;
+
+    // ROM Scorpion ZS 256: 4 x 16K (scorpa..scorpd.rom)
+    uint8_t rom_scorpion[4][16384];
+    bool    have_rom_scorpion;
+
+    // RAM: 16 bancos x 16K (8 para 128K, 16 para Scorpion 256K)
+    uint8_t ram[16][16384];
 
     // Mapa actual de páginas 16K (0x0000..0xFFFF)
     uint8_t* mem_map[4];
@@ -171,9 +188,9 @@ typedef struct {
     // ROM seleccionada (128: 0/1, +3: 0..3)
     uint8_t  rom_page;
 
-    // Puerto 0x1FFD (+2A/+3)
+    // Puerto 0x1FFD (+2A/+3 y Scorpion)
     uint8_t  port_1ffd;
-    bool     special_paging; // bit0 de 1FFD
+    bool     special_paging; // bit0 de 1FFD (+3) / bit0 = RAM overlay (Scorpion)
 
     // Puntero al banco que usa la ULA como pantalla
     uint8_t* screen_ptr;
@@ -232,6 +249,10 @@ typedef struct {
     // FDC (+3)
     FDC fdc;
 
+    // Beta 128 (Pentagon/Scorpion)
+    Beta128 beta;
+    bool beta_active;     // ROM Beta paginada en 0x0000-0x3FFF
+
     // Cintas
     TAPPlayer  tap;
     TZXPlayer  tzx;
@@ -255,6 +276,13 @@ int  spectrum_load_rom_plus3_set(ZXSpectrum* spec,
                                 const char* rom1,
                                 const char* rom2,
                                 const char* rom3);
+int  spectrum_load_rom_beta(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_rom_scorpion_service(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_rom_scorpion_set(ZXSpectrum* spec,
+                                    const char* roma,
+                                    const char* romb,
+                                    const char* romc,
+                                    const char* romd);
 
 int  spectrum_load_sna(ZXSpectrum* spec, const char* filename);
 int  spectrum_load_tap(ZXSpectrum* spec, const char* filename);
