@@ -95,71 +95,64 @@ static void decode_chars(TehkanWC* t) {
 
 // Sprites: 16x16, 4bpp, stride=128 bytes
 // rows[r] = r*32 para r<8, luego 16*32 + (r-8)*32 para r>=8
-//   (rows: { 0*32..7*32, 16*32..23*32 })
-// pixels cols 0-7: como chars (pair c/2, byte en row_base+pair)
-// pixels cols 8-15: offset extra de 8*32 = 256 bits = 32 bytes
-//   → byte_offset_extra = 32 (= 8 columnas * 4 bits/col en nibbles = 32 bytes)
+// cols 0-7: como chars (pair c/2, byte en row_base+pair)
+// cols 8-15: offset extra de 256 bits = 32 bytes
+// Nibble order en esta placa: pixel par = nibble bajo, pixel impar = nibble alto (nibbles swapped)
 static void decode_sprites(TehkanWC* t) {
     for (int s = 0; s < TWC_SPRITES_NUM; s++) {
+        int tile_base = s * 128;
+
         for (int row = 0; row < TWC_SPR_H; row++) {
-            // row offset: 0..7 → row*32; 8..15 → 16*32 + (row-8)*32
-            int row_byte = (row < 8) ? row * 4 : (16 + (row - 8)) * 4;
-            int tile_base = s * 128;
+            // row offset: 0..7 -> row*4 ; 8..15 -> (16+(row-8))*4
+            int row_byte = (row < 8) ? (row * 4) : ((16 + (row - 8)) * 4);
+
             for (int col = 0; col < TWC_SPR_W; col++) {
-                // cols 0-7: bytes 0-3 de la fila; cols 8-15: +32 bytes (=8 pares más)
-                int col_group = col / 8;  // 0=izquierda, 1=derecha
-                int col_in_group = col & 7;
-                int pair = col_in_group / 2;
-                bool is_hi = (col_in_group & 1) == 0;
+                int col_group      = col / 8;     // 0=izquierda, 1=derecha
+                int col_in_group   = col & 7;     // 0..7 dentro de la mitad
+                int pair           = col_in_group / 2;
+
+                // ✅ CORRECCIÓN: impar -> nibble alto, par -> nibble bajo
+                bool is_hi = (col_in_group & 1) != 0;
+
                 int off = tile_base + row_byte + col_group * 32 + pair;
                 if (off >= TWC_GFX2_SIZE) continue;
-                uint8_t b = t->gfx2[off];
-                t->spr_pix[s][row][col] = is_hi ? (b >> 4) & 0xF : b & 0xF;
-            }
-        }
-    }
-}
 
-#if 0
-static void decode_tiles(TehkanWC* t) {
-    // BG Tiles: 16x8, 4bpp, 64 bytes por tile.
-    // Filas lineales (8 bytes por fila) + orden nibble "swapped"
-    // (col par usa nibble alto, col impar usa nibble bajo) -> xoffset {4,0,12,8,...}
-    for (int tile = 0; tile < TWC_BGTILES_NUM; tile++) {
-        int tile_base = tile * 64;
-        for (int row = 0; row < TWC_TILE_H; row++) {
-            int row_base = tile_base + row * 8;
-            for (int col = 0; col < TWC_TILE_W; col++) {
-                int byte_in_row = col >> 1;          // 0..7
-                bool is_hi = (col & 1) == 0;         // col par -> nibble alto (swapped)
-                int off = row_base + byte_in_row;
-                if (off >= TWC_GFX3_SIZE) continue;
-                uint8_t b = t->gfx3[off];
-                t->tile_pix[tile][row][col] = is_hi ? ((b >> 4) & 0xF) : (b & 0xF);
+                uint8_t b = t->gfx2[off];
+                t->spr_pix[s][row][col] = is_hi ? ((b >> 4) & 0x0F) : (b & 0x0F);
             }
         }
     }
 }
-#endif
 
 #if 1
 // BG Tiles: 16x8, 4bpp, stride=64 bytes
 // rows[r] = r*32 para r<8 (8 filas de 4 bytes cada una)
 // pixels cols 0-7: bytes 0-3; cols 8-15: +32 bytes (=32*8 bits)
+// BG Tiles: 16x8, 4bpp, stride=64 bytes
+// rows[r] = r*32 bits => r*4 bytes (8 filas * 4 bytes = 32 bytes) para la mitad izquierda
+// cols 0-7  -> dentro de los primeros 32 bytes
+// cols 8-15 -> +256 bits = +32 bytes (mitad derecha)
+// Nibble order en esta placa: pixel par = nibble bajo, pixel impar = nibble alto (nibbles swapped)
 static void decode_tiles(TehkanWC* t) {
     for (int tile = 0; tile < TWC_BGTILES_NUM; tile++) {
+        int tile_base = tile * 64;
+
         for (int row = 0; row < TWC_TILE_H; row++) {
-            int row_byte  = row * 4;
-            int tile_base = tile * 64;
+            int row_byte = row * 4;
+
             for (int col = 0; col < TWC_TILE_W; col++) {
-                int col_group   = col / 8;
-                int col_in_group = col & 7;
-                int pair   = col_in_group / 2;
-                bool is_hi = (col_in_group & 1) == 0;
-                int off    = tile_base + row_byte + col_group * 32 + pair;
+                int col_group     = col / 8;      // 0=mitad izq, 1=mitad der
+                int col_in_group  = col & 7;      // 0..7 dentro de la mitad
+                int pair          = col_in_group / 2; // 0..3 byte dentro de la fila
+
+                // ✅ CORRECCIÓN: (impar -> nibble alto), igual que decode_chars()
+                bool is_hi = (col_in_group & 1) != 0;
+
+                int off = tile_base + row_byte + col_group * 32 + pair;
                 if (off >= TWC_GFX3_SIZE) continue;
+
                 uint8_t b = t->gfx3[off];
-                t->tile_pix[tile][row][col] = is_hi ? (b >> 4) & 0xF : b & 0xF;
+                t->tile_pix[tile][row][col] = is_hi ? ((b >> 4) & 0x0F) : (b & 0x0F);
             }
         }
     }
