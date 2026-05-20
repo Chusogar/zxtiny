@@ -29,7 +29,7 @@
  *                 = 384 colores de 16 bits: byte0=GGGGRRRRR, byte1=xxxxBBBB
  *                 768 colores indexados en total (GFX1: 0-255, GFX2: 256-383, GFX3: 512-767)
  *
- *   BG VRAM   : 0xE000-0xE7FF  tile codes (64x16 tiles 16x8) = 2 bytes por tile
+ *   BG VRAM   : 0xE000-0xE7FF  tile codes (32x32 tiles 16x8) = 2 bytes por tile
  *                 byte 0: tile code bajo (0-255)
  *                 byte 1: bits 0-3=color, bits 4-5=code high (tile 0-1023),
  *                         bit6=flipX, bit7=flipY
@@ -108,7 +108,7 @@
 #define TWC_PALRAM_START    0xD800
 #define TWC_PALRAM_SIZE     0x0600   // 768 bytes (384 colores x 2 bytes)
 #define TWC_BGVRAM_START    0xE000
-#define TWC_BGVRAM_SIZE     0x0800   // 2 KB (64x16 tiles x 2 bytes)
+#define TWC_BGVRAM_SIZE     0x0800   // 2 KB (32x32 tiles x 2 bytes = 1024 entradas)
 #define TWC_SPRITERAM_START 0xE800
 #define TWC_SPRITERAM_SIZE  0x0400   // 1 KB (256 sprites x 4 bytes)
 #define TWC_SCROLL_X_LO     0xEC00
@@ -142,11 +142,15 @@
 #define TWC_SPR_COLOR_BASE  256      // GFX2:  8 grupos x 16 colores = 128
 #define TWC_BG_COLOR_BASE   512      // GFX3: 16 grupos x 16 colores = 256
 
+// Dimensiones del tilemap de fondo (BG)
+#define TWC_BG_COLS 32
+#define TWC_BG_ROWS 32
+
 // ---------------------------------------------------------------------------
 // Video
 // ---------------------------------------------------------------------------
 // Visible: 256x224 (visible_area {0,255,16,239})
-// BG bitmap intermedio: 512x256 (64 cols x 32 filas de 8px = 512x256)
+// BG bitmap intermedio: 512x256 (32 cols x 32 filas de tiles 16x8 = 512x256)
 // pero el scroll solo usa 512 de ancho y 256 de alto
 #define TWC_SCREEN_W        256
 #define TWC_SCREEN_H        224

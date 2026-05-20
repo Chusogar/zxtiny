@@ -71,13 +71,15 @@ static int load_file(uint8_t* dst, int max_size, const char* path,
 
 // Chars: 8x8, 4bpp, stride=32 bytes, 4 bytes por fila
 // rows[r] = r*32 → fila r empieza en byte r*4 dentro del tile
+#if 1
 static void decode_chars(TehkanWC* t) {
     for (int tile = 0; tile < TWC_CHARS_NUM; tile++) {
         for (int row = 0; row < TWC_CHAR_H; row++) {
             int row_base = tile * 32 + row * 4;
             for (int col = 0; col < TWC_CHAR_W; col++) {
                 int pair    = col / 2;
-                bool is_hi  = (col & 1) == 0;  // pixel par → nibble alto
+                bool is_hi  = (col & 1) != 0;  // pixel par → nibble alto REJILLA CORRECTA
+				//bool is_hi  = (col & 1) == 0;  // REJILLA INCORRECTA
                 int  off    = row_base + pair;
                 if (off >= TWC_GFX1_SIZE) continue;
                 uint8_t b   = t->gfx1[off];
@@ -86,6 +88,10 @@ static void decode_chars(TehkanWC* t) {
         }
     }
 }
+#endif
+
+
+
 
 // Sprites: 16x16, 4bpp, stride=128 bytes
 // rows[r] = r*32 para r<8, luego 16*32 + (r-8)*32 para r>=8
@@ -114,6 +120,29 @@ static void decode_sprites(TehkanWC* t) {
     }
 }
 
+#if 0
+static void decode_tiles(TehkanWC* t) {
+    // BG Tiles: 16x8, 4bpp, 64 bytes por tile.
+    // Filas lineales (8 bytes por fila) + orden nibble "swapped"
+    // (col par usa nibble alto, col impar usa nibble bajo) -> xoffset {4,0,12,8,...}
+    for (int tile = 0; tile < TWC_BGTILES_NUM; tile++) {
+        int tile_base = tile * 64;
+        for (int row = 0; row < TWC_TILE_H; row++) {
+            int row_base = tile_base + row * 8;
+            for (int col = 0; col < TWC_TILE_W; col++) {
+                int byte_in_row = col >> 1;          // 0..7
+                bool is_hi = (col & 1) == 0;         // col par -> nibble alto (swapped)
+                int off = row_base + byte_in_row;
+                if (off >= TWC_GFX3_SIZE) continue;
+                uint8_t b = t->gfx3[off];
+                t->tile_pix[tile][row][col] = is_hi ? ((b >> 4) & 0xF) : (b & 0xF);
+            }
+        }
+    }
+}
+#endif
+
+#if 1
 // BG Tiles: 16x8, 4bpp, stride=64 bytes
 // rows[r] = r*32 para r<8 (8 filas de 4 bytes cada una)
 // pixels cols 0-7: bytes 0-3; cols 8-15: +32 bytes (=32*8 bits)
@@ -135,6 +164,7 @@ static void decode_tiles(TehkanWC* t) {
         }
     }
 }
+#endif
 
 void tehkanwc_decode_gfx(TehkanWC* t) {
     if (t->char_pix) decode_chars(t);
@@ -176,6 +206,7 @@ static void rebuild_palette(TehkanWC* t)
                         (uint32_t)b;
     }
 }
+
 // ---------------------------------------------------------------------------
 // VRAM compartida: lectura y escritura con dirty flags
 // ---------------------------------------------------------------------------
@@ -674,6 +705,14 @@ void tehkanwc_handle_key(TehkanWC* t, SDL_Scancode sc, bool pressed) {
     case SDL_SCANCODE_2: if (pressed) t->coins &= ~0x08; else t->coins |= 0x08; break;
     case SDL_SCANCODE_ESCAPE:
         if (pressed) { t->quit = true; } break;
+	// Turbo
+	case SDL_SCANCODE_F2:
+		if (pressed) {
+			t->turbo_mode = !t->turbo_mode;
+			//if (!t->turbo_mode && t->audio_dev > 0) SDL_ClearQueuedAudio(t->audio_dev);
+			printf("[EMU] Velocidad %s\n", t->turbo_mode ? "MAXIMA" : "normal");
+		}
+		return;
     case SDL_SCANCODE_F5:
         if (pressed) memset(t->bg_dirty, 1, sizeof(t->bg_dirty));
         break;
