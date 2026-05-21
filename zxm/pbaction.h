@@ -12,7 +12,7 @@
 #define PBA_AUDIO_HZ  3072000
 #define PBA_FPS       60
 
-// Video (PCB 256x224 rotada 90º CW)
+// Video (PCB 256x224 rotada 90  CW)
 #define PBA_LOG_W     256
 #define PBA_LOG_H     224
 #define PBA_SCREEN_W  224
@@ -65,6 +65,14 @@ typedef struct {
 
     uint32_t logbuf[PBA_LOG_W * PBA_LOG_H];
     uint32_t framebuffer[PBA_SCREEN_W * PBA_SCREEN_H];
+
+    // Audio (SDL + AY8910)
+    SDL_AudioDeviceID audio_dev;
+    int audio_rate;
+    float audio_gain;
+    bool audio_enabled;
+    uint32_t ay_write_count;
+    bool audio_test_tone;
 
     SDL_Window* window;
     SDL_Renderer* renderer;

@@ -1,17 +1,17 @@
 /*
  * pbaction.c  -  Emulador (mini) de Pinball Action (Tehkan, 1985)
  *
- * Objetivo: replicar la misma filosofía que phoenix.c:
+ * Objetivo: replicar la misma filosof a que phoenix.c:
  *   - todo en 1 .c + 1 .h
  *   - cargar ROMs desde una carpeta (--dir)
  *   - emular lo esencial de CPU+memmap+video+inputs
- *   - sonido: stub (captura de writes a AY y command latch) para extender luego
+ *   - sonido: AY-3-8910 x3 por SDL (S16 mono) + debug (F3 tono, F4 ganancia, logs)
  *
  * Referencias (hardware / mapas / GFX):
- *   - Driver clásico MAME (pbaction.c) con mapa de memoria, entradas y layouts.
+ *   - Driver cl sico MAME (pbaction.c) con mapa de memoria, entradas y layouts.
  *
  * Compilar (ejemplo):
- *   gcc pbaction.c z80/jgz80/z80.c -o pbaction -lSDL2 -O2
+ *   gcc pbaction.c z80/jgz80/z80.c -o pbaction -lSDL2 -lm -O2
  *
  * Ejecutar:
  *   ./pbaction --dir /ruta/a/roms/pbaction
@@ -24,11 +24,12 @@
 #include <string.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <math.h>
 
 // ----------------------------------------------------------------------------
 // (Opcional) API de interrupciones del core Z80
 // ----------------------------------------------------------------------------
-// Nota: phoenix no usa IRQ/NMI. Pinball Action sí.
+// Nota: phoenix no usa IRQ/NMI. Pinball Action s .
 // Como no conocemos a priori la API exacta del core Z80 que uses, este fichero
 // soporta tres macros opcionales:
 //   -DJGZ80_HAVE_RESET  -> expone: void z80_reset(z80*);
@@ -65,11 +66,11 @@ static inline void pb_z80_pulse_nmi(z80* cpu) {
 }
 
 static inline void pb_z80_irq_vec(z80* cpu, uint8_t vec) {
-#ifdef JGZ80_HAVE_IRQ
-    z80_irq(cpu, vec);
-#else
-    (void)cpu; (void)vec;
-#endif
+//#ifdef JGZ80_HAVE_IRQ
+    z80_pulse_irq(cpu, vec);
+//#else
+//    (void)cpu; (void)vec;
+//#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -103,7 +104,7 @@ static int find_file_ci(const char* dir, const char* base, char* out_path, size_
         if (file_exists(tmp)) { snprintf(out_path, out_sz, "%s", tmp); return 0; }
     }
 
-    // búsqueda case-insensitive por nombre sin extension
+    // b squeda case-insensitive por nombre sin extension
     DIR* d = opendir(dir);
     if (!d) return -1;
 
@@ -197,8 +198,8 @@ int pbaction_load_from_dir(PBAction* s, const char* dir) {
     }
 
     // En vez de depender de una estructura interna, guardamos el ROM de audio aparte:
-    // reutilizamos s->ram temporalmente NO; creamos un buffer local estático?
-    // Para simplicidad, añadimos un buffer de audio ROM embebido en PBAction via malloc.
+    // reutilizamos s->ram temporalmente NO; creamos un buffer local est tico?
+    // Para simplicidad, a adimos un buffer de audio ROM embebido en PBAction via malloc.
     // (ver abajo: s->audiocpu user data usa pbaction_audio_mem_read)
 
     // Cargar a buffer 'rom_audio' (al final de este fichero).
@@ -227,7 +228,7 @@ int pbaction_load_from_dir(PBAction* s, const char* dir) {
     }
 
     // sprites: b-c7,b-d7,b-f7 (8KB c/u)
-    const char* sp_names[3] = {"b-c7", "b-d7", "b-f7"};
+    const char* sp_names[3] = {"b-c7.bin", "b-d7.bin", "b-f7.bin"};
     for (int i = 0; i < 3; i++) {
         if (find_file_ci(dir, sp_names[i], path, sizeof(path)) != 0) {
             fprintf(stderr, "[ROM] No encuentro %s en %s\n", sp_names[i], dir);
@@ -364,64 +365,346 @@ static void audio_mem_write(void* user, uint16_t addr, uint8_t val) {
     (void)addr; (void)val;
 }
 
-// AY stub: mapeo de puertos 0x10/0x11, 0x20/0x21, 0x30/0x31 (mask 0xff)
-// Guardamos registro seleccionado y valores escritos por chip.
+// ----------------------------------------------------------------------------
+// AY-3-8910 (x3) + salida de audio por SDL
+// ----------------------------------------------------------------------------
+// Pinball Action usa 3 chips AY-3-8910 controlados por la CPU de sonido.
+// El clock exacto depende de la placa; aproximamos AY_CLOCK = PBA_AUDIO_HZ/2.
+// El AY divide internamente por 16 para su base de tiempo.
+
+#define PBA_AY_CHIPS 3
+#define PBA_AY_CLOCK (PBA_AUDIO_HZ/2)
 
 typedef struct {
-    uint8_t reg;
     uint8_t regs[16];
-} AYStub;
+    uint8_t addr;
 
-static AYStub ay[3];
+    // 16.16 fixed-point, unidades en (AY_CLOCK/16)
+    uint32_t tone_period_fp[3];
+    uint32_t tone_count_fp[3];
+    uint8_t  tone_out[3];
 
-static uint8_t audio_port_in(z80* z, uint16_t port) {
-    
-    port &= 0xFF;
-    // no hay lecturas usadas aquí (podría haber)
-    return 0xFF;
+    uint32_t noise_period_fp;
+    uint32_t noise_count_fp;
+    uint32_t lfsr; // 17-bit
+    uint8_t  noise_out;
+
+    uint32_t env_period_fp;
+    uint32_t env_count_fp;
+    uint8_t  env_shape;
+    uint8_t  env_hold_active;
+    int      env_dir;
+    uint8_t  env_phase;
+    uint8_t  env_vol;
+} AY8910;
+
+static AY8910 g_ay[PBA_AY_CHIPS];
+static uint32_t g_ay_ticks_per_sample_fp = 0; // 16.16
+
+// HP (quita DC)
+static float g_hp_prev_x = 0.0f;
+static float g_hp_prev_y = 0.0f;
+
+// Debug: detectar si se ha escrito algÃºn volumen no-cero
+static uint32_t g_ay_data_writes = 0;
+static int g_any_nonzero_vol = 0;
+
+// Tabla de volumen (aprox)
+static const float g_ay_voltbl[16] = {
+    0.0000f, 0.0040f, 0.0060f, 0.0090f,
+    0.0130f, 0.0190f, 0.0280f, 0.0420f,
+    0.0630f, 0.0940f, 0.1410f, 0.2110f,
+    0.3160f, 0.4730f, 0.7070f, 1.0000f
+};
+
+static inline uint32_t ay_make_fp(uint32_t v) { return v << 16; }
+
+static void ay_recalc_periods(AY8910* a) {
+    // Tono: 12-bit regs 0..5
+    for (int ch = 0; ch < 3; ch++) {
+        int r = ch * 2;
+        uint32_t p = (uint32_t)a->regs[r] | (((uint32_t)a->regs[r + 1] & 0x0F) << 8);
+        if (p == 0) p = 1;
+        a->tone_period_fp[ch] = ay_make_fp(p);
+    }
+
+    // Ruido: 5-bit reg 6
+    uint32_t np = (uint32_t)(a->regs[6] & 0x1F);
+    if (np == 0) np = 1;
+    a->noise_period_fp = ay_make_fp(np);
+
+    // Envolvente: 16-bit regs 11/12
+    uint32_t ep = (uint32_t)a->regs[11] | ((uint32_t)a->regs[12] << 8);
+    if (ep == 0) ep = 1;
+    a->env_period_fp = ay_make_fp(ep);
 }
 
-static void ay_addr_data_write(int idx, uint16_t port, uint8_t val) {
-    // En MAME: ay8910_address_data_w se usa con dos puertos consecutivos
-    //  - puerto par: address
-    //  - puerto impar: data
-    if ((port & 1) == 0) {
-        ay[idx].reg = val & 0x0F;
-    } else {
-        ay[idx].regs[ay[idx].reg & 0x0F] = val;
+static void ay_env_restart(AY8910* a, uint8_t shape) {
+    a->env_shape = shape & 0x0F;
+    a->env_hold_active = 0;
+    a->env_phase = 0;
+
+    // C=bit3, A=bit2, ALT=bit1, HOLD=bit0
+    int attack = (a->env_shape & 0x04) ? 1 : 0;
+    a->env_dir = attack ? +1 : -1;
+    a->env_vol = attack ? 0 : 15;
+    a->env_count_fp = 0;
+}
+
+static inline uint8_t ay_env_continue(const AY8910* a) { return (a->env_shape & 0x08) ? 1 : 0; }
+static inline uint8_t ay_env_attack  (const AY8910* a) { return (a->env_shape & 0x04) ? 1 : 0; }
+static inline uint8_t ay_env_alt     (const AY8910* a) { return (a->env_shape & 0x02) ? 1 : 0; }
+static inline uint8_t ay_env_hold    (const AY8910* a) { return (a->env_shape & 0x01) ? 1 : 0; }
+
+static void ay_step_envelope(AY8910* a) {
+    if (a->env_hold_active) return;
+
+    a->env_phase++;
+    if (a->env_phase >= 16) {
+        if (!ay_env_continue(a)) {
+            a->env_hold_active = 1;
+            a->env_vol = 0;
+            return;
+        }
+        if (ay_env_hold(a)) {
+            a->env_hold_active = 1;
+            a->env_vol = ay_env_attack(a) ? 15 : 0;
+            return;
+        }
+        if (ay_env_alt(a)) a->env_dir = -a->env_dir;
+        a->env_phase = 0;
     }
+
+    a->env_vol = (a->env_dir > 0) ? a->env_phase : (uint8_t)(15 - a->env_phase);
+}
+
+static void ay_reset(AY8910* a) {
+    memset(a, 0, sizeof(*a));
+    a->lfsr = 0x1FFFFu;
+    a->noise_out = 1;
+    for (int ch = 0; ch < 3; ch++) {
+        a->tone_out[ch] = 0;
+        a->tone_count_fp[ch] = 0;
+    }
+    ay_recalc_periods(a);
+    ay_env_restart(a, 0);
+}
+
+static void ay_write_reg(AY8910* a, int r, uint8_t v) {
+    r &= 0x0F;
+    a->regs[r] = v;
+    if (r <= 6 || r == 11 || r == 12) ay_recalc_periods(a);
+    if (r == 13) ay_env_restart(a, v);
+}
+
+static uint8_t ay_read_reg(const AY8910* a) {
+    return a->regs[a->addr & 0x0F];
+}
+
+static inline int16_t clamp16(int v) {
+    if (v < -32768) return -32768;
+    if (v >  32767) return  32767;
+    return (int16_t)v;
+}
+
+static float ay_render_sample(AY8910* a, uint32_t ticks_fp) {
+    // Tono
+    for (int ch = 0; ch < 3; ch++) {
+        a->tone_count_fp[ch] += ticks_fp;
+        uint32_t per = a->tone_period_fp[ch];
+        while (a->tone_count_fp[ch] >= per) {
+            a->tone_count_fp[ch] -= per;
+            a->tone_out[ch] ^= 1;
+        }
+    }
+
+    // Ruido (LFSR 17-bit, newbit = bit0 XOR bit3)
+    a->noise_count_fp += ticks_fp;
+    while (a->noise_count_fp >= a->noise_period_fp) {
+        a->noise_count_fp -= a->noise_period_fp;
+        uint32_t bit0 = a->lfsr & 1u;
+        uint32_t bit3 = (a->lfsr >> 3) & 1u;
+        uint32_t newb = bit0 ^ bit3;
+        a->lfsr = (a->lfsr >> 1) | (newb << 16);
+        a->noise_out = (uint8_t)(a->lfsr & 1u);
+    }
+
+    // Envolvente
+    a->env_count_fp += ticks_fp;
+    while (a->env_count_fp >= a->env_period_fp) {
+        a->env_count_fp -= a->env_period_fp;
+        ay_step_envelope(a);
+    }
+
+    // Mezcla
+    uint8_t enable = a->regs[7];
+    float out = 0.0f;
+
+    for (int ch = 0; ch < 3; ch++) {
+        int tone_dis  = (enable >> ch) & 1;
+        int noise_dis = (enable >> (ch + 3)) & 1;
+
+        float tone_sig = tone_dis ? 1.0f : (a->tone_out[ch] ? 1.0f : -1.0f);
+        float noise_gate = noise_dis ? 1.0f : (a->noise_out ? 1.0f : 0.0f);
+
+        uint8_t vr = a->regs[8 + ch];
+        uint8_t v = (vr & 0x10) ? a->env_vol : (vr & 0x0F);
+        float amp = g_ay_voltbl[v & 0x0F];
+
+        out += tone_sig * noise_gate * amp;
+    }
+
+    return out;
+}
+
+static inline void pb_audio_lock(PBAction* s) {
+    if (s && s->audio_dev) SDL_LockAudioDevice(s->audio_dev);
+}
+static inline void pb_audio_unlock(PBAction* s) {
+    if (s && s->audio_dev) SDL_UnlockAudioDevice(s->audio_dev);
+}
+
+static void pb_audio_callback(void* userdata, Uint8* stream, int len) {
+    PBAction* s = (PBAction*)userdata;
+    if (!s || !s->audio_enabled || g_ay_ticks_per_sample_fp == 0) {
+        memset(stream, 0, (size_t)len);
+        return;
+    }
+
+    int16_t* out = (int16_t*)stream;
+    int nsamp = len / (int)sizeof(int16_t);
+
+    static float phase = 0.0f;
+    const float hp_a = 0.995f;
+
+    for (int i = 0; i < nsamp; i++) {
+        float mix;
+
+        // Debug Ãºtil: si no hay volÃºmenes no-cero, mantenemos tono de test
+        if (s->audio_test_tone || (!g_any_nonzero_vol)) {
+            float inc = 2.0f * 3.14159265f * 440.0f / (float)(s->audio_rate ? s->audio_rate : 44100);
+            phase += inc;
+            if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
+            mix = 0.20f * (float)sin(phase);
+        } else {
+            mix = 0.0f;
+            for (int k = 0; k < PBA_AY_CHIPS; k++) {
+                mix += ay_render_sample(&g_ay[k], g_ay_ticks_per_sample_fp);
+            }
+            mix *= (1.0f / (float)PBA_AY_CHIPS);
+            mix *= (s->audio_gain > 0.0f ? s->audio_gain : 0.25f);
+        }
+
+        // HP: y[n] = x[n] - x[n-1] + a*y[n-1]
+        float y = mix - g_hp_prev_x + hp_a * g_hp_prev_y;
+        g_hp_prev_x = mix;
+        g_hp_prev_y = y;
+
+        out[i] = clamp16((int)(y * 32767.0f));
+    }
+}
+
+static uint8_t audio_port_in(z80* z, uint16_t port) {
+    PBAction* s = (PBAction*)z->userdata;
+    port &= 0xFF;
+
+    pb_audio_lock(s);
+    uint8_t v = 0xFF;
+    if (port == 0x11) v = ay_read_reg(&g_ay[0]);
+    else if (port == 0x21) v = ay_read_reg(&g_ay[1]);
+    else if (port == 0x31) v = ay_read_reg(&g_ay[2]);
+    pb_audio_unlock(s);
+
+    return v;
 }
 
 static void audio_port_out(z80* z, uint16_t port, uint8_t val) {
-    
+    PBAction* s = (PBAction*)z->userdata;
     port &= 0xFF;
-    if (port == 0x10 || port == 0x11) { ay_addr_data_write(0, port, val); return; }
-    if (port == 0x20 || port == 0x21) { ay_addr_data_write(1, port, val); return; }
-    if (port == 0x30 || port == 0x31) { ay_addr_data_write(2, port, val); return; }
+
+    pb_audio_lock(s);
+
+    // Log 1er acceso a puertos AY
+    if (s) {
+        s->ay_write_count++;
+        if (s->ay_write_count == 1) {
+            fprintf(stderr, "[AUDIO] primer write a puertos AY (port=0x%02X val=0x%02X)\n", (unsigned)port, (unsigned)val);
+        }
+    }
+
+    // Cada AY usa dos puertos consecutivos: par=address / impar=data
+    if (port == 0x10) { g_ay[0].addr = val & 0x0F; pb_audio_unlock(s); return; }
+    if (port == 0x20) { g_ay[1].addr = val & 0x0F; pb_audio_unlock(s); return; }
+    if (port == 0x30) { g_ay[2].addr = val & 0x0F; pb_audio_unlock(s); return; }
+
+    if (port == 0x11) {
+        // Debug: log primeras escrituras DATA
+        if (g_ay_data_writes < 32) {
+            fprintf(stderr, "[AUDIO] AY0 reg%u = 0x%02X (port 0x11)\n", (unsigned)(g_ay[0].addr & 0x0F), (unsigned)val);
+        }
+        g_ay_data_writes++;
+        uint8_t r = g_ay[0].addr & 0x0F;
+        if ((r >= 8 && r <= 10) && (val & 0x1F)) g_any_nonzero_vol = 1;
+        ay_write_reg(&g_ay[0], g_ay[0].addr, val);
+        pb_audio_unlock(s);
+        return;
+    }
+
+    if (port == 0x21) {
+        if (g_ay_data_writes < 32) {
+            fprintf(stderr, "[AUDIO] AY1 reg%u = 0x%02X (port 0x21)\n", (unsigned)(g_ay[1].addr & 0x0F), (unsigned)val);
+        }
+        g_ay_data_writes++;
+        uint8_t r = g_ay[1].addr & 0x0F;
+        if ((r >= 8 && r <= 10) && (val & 0x1F)) g_any_nonzero_vol = 1;
+        ay_write_reg(&g_ay[1], g_ay[1].addr, val);
+        pb_audio_unlock(s);
+        return;
+    }
+
+    if (port == 0x31) {
+        if (g_ay_data_writes < 32) {
+            fprintf(stderr, "[AUDIO] AY2 reg%u = 0x%02X (port 0x31)\n", (unsigned)(g_ay[2].addr & 0x0F), (unsigned)val);
+        }
+        g_ay_data_writes++;
+        uint8_t r = g_ay[2].addr & 0x0F;
+        if ((r >= 8 && r <= 10) && (val & 0x1F)) g_any_nonzero_vol = 1;
+        ay_write_reg(&g_ay[2], g_ay[2].addr, val);
+        pb_audio_unlock(s);
+        return;
+    }
+
+    pb_audio_unlock(s);
 }
 
 // ----------------------------------------------------------------------------
-// Paleta (xxxxBBBBGGGGRRRR, little-endian)
+// Paleta (xxxxBBBBGGGGRRRR, little-endian) + update por entrada
 // ----------------------------------------------------------------------------
-
 static inline uint8_t pal4_to_8(uint8_t v) {
-    // 0..15 -> 0..255
     return (uint8_t)((v << 4) | v);
 }
 
+static void pbaction_update_palette_entry(PBAction* s, int i) {
+    int o = i * 2;
+    uint16_t w = (uint16_t)s->palram[o + 0] | ((uint16_t)s->palram[o + 1] << 8);
+
+    uint8_t r4 = (uint8_t)((w >> 0) & 0x0F);
+    uint8_t g4 = (uint8_t)((w >> 4) & 0x0F);
+    uint8_t b4 = (uint8_t)((w >> 8) & 0x0F);
+
+    uint8_t r = pal4_to_8(r4);
+    uint8_t g = pal4_to_8(g4);
+    uint8_t b = pal4_to_8(b4);
+
+    s->palette[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 void pbaction_build_palette(PBAction* s) {
-    for (int i = 0; i < PBA_NUM_COLORS; i++) {
-        int o = i * 2;
-        uint16_t w = (uint16_t)s->palram[o] | ((uint16_t)s->palram[o + 1] << 8);
-        uint8_t r = pal4_to_8((uint8_t)(w & 0x0F));
-        uint8_t g = pal4_to_8((uint8_t)((w >> 4) & 0x0F));
-        uint8_t b = pal4_to_8((uint8_t)((w >> 8) & 0x0F));
-        s->palette[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-    }
+    for (int i = 0; i < PBA_NUM_COLORS; i++) pbaction_update_palette_entry(s, i);
 }
 
 // ----------------------------------------------------------------------------
-// Decodificación de GFX (planar por fracciones)
+// Decodificaci n de GFX (planar por fracciones)
 // ----------------------------------------------------------------------------
 
 static inline uint8_t get_bit_msb(uint8_t byte, int x) {
@@ -460,7 +743,7 @@ static uint8_t spr16_pixel(PBAction* s, int code, int x, int y) {
     const int planes = 3;
     const int plane_sz = (int)(sizeof(s->sprites) / planes);
     uint8_t p = 0;
-    // cada sprite 16x16: 32 bytes por plano (según layout 32*8)
+    // cada sprite 16x16: 32 bytes por plano (seg n layout 32*8)
     int base_off = (code & 0x7F) * 32;
     int row = y;
     int byte_off = base_off + (row * 2) + (x >> 3);
@@ -474,7 +757,7 @@ static uint8_t spr16_pixel(PBAction* s, int code, int x, int y) {
 }
 
 // 32x32 grande: usamos el layout MAME (spritelayout2) simplificado
-// Para una implementación exacta, lo ideal es replicar los x/y offsets de MAME.
+// Para una implementaci n exacta, lo ideal es replicar los x/y offsets de MAME.
 static uint8_t spr32_pixel(PBAction* s, int code, int x, int y) {
     // Descomponer en 4 subtiles 16x16 del mismo code base
     int subx = x >> 4;
@@ -496,106 +779,256 @@ static void clear_log(PBAction* s) {
     for (int i = 0; i < PBA_LOG_W * PBA_LOG_H; i++) s->logbuf[i] = 0xFF000000u;
 }
 
-static void draw_bg(PBAction* s) {
-    // 32x32 tilemap, visible 256x224; aplicamos scroll vertical (en el eje X lógico) como MAME sugiere.
-    // En el driver clásico se comenta "bg scroll" en e606.
-    int scroll = s->bg_scroll;
+static void draw_bg(PBAction* s)
+{
+    // BG: tilemap 32x32 de 8x8 => 256x256.
+    // Visible en el "logical buffer": 256x224 (PBA_LOG_W x PBA_LOG_H). [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)
+    //
+    // s->bg_scroll: scroll (8-bit). En muchos boards Tehkan el BG scroll es vertical
+    // respecto al  rea visible. Como aqu  trabajamos en buffer NO rotado (256x224),
+    // aplicamos el scroll sobre Y del mundo (map 256x256). [1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
+    //
+    // Atributos t picos:
+    //  - code: videoram_bg[offs] + bits extra desde colorram_bg
+    //  - color: nibble bajo de colorram_bg
+    //
+    // Nota: Si el bit 4-7 de colorram se usan como code-high, lo soportamos.
+
+    const int scroll = (int)s->bg_scroll;  // 0..255 [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)
+
+    for (int sy = 0; sy < PBA_LOG_H; sy++) {
+        // y dentro del tilemap 256x256 con scroll
+        int my = (sy + scroll) & 0xFF;        // 0..255
+        int ty = (my >> 3) & 31;              // tile y 0..31
+        int py = my & 7;                      // pixel en tile 0..7
+
+        for (int sx = 0; sx < PBA_LOG_W; sx++) {
+            int mx = sx & 0xFF;               // 0..255
+            int tx = (mx >> 3) & 31;          // tile x 0..31
+            int px = mx & 7;                  // pixel en tile 0..7
+
+            // Flipscreen: invierte coordenadas dentro del buffer l gico
+            int dsx = sx;
+            int dsy = sy;
+            int fpx = px;
+            int fpy = py;
+            int ftx = tx;
+            int fty = ty;
+
+            if (s->flipscreen) {
+                // flip total del  rea visible 256x224
+                dsx = (PBA_LOG_W - 1) - sx;
+                dsy = (PBA_LOG_H - 1) - sy;
+
+                // flip dentro del tilemap 256x256
+                mx = (255 - sx) & 0xFF;
+                my = (255 - ((sy + scroll) & 0xFF)) & 0xFF;
+
+                ftx = (mx >> 3) & 31;
+                fty = (my >> 3) & 31;
+                fpx = mx & 7;
+                fpy = my & 7;
+            }
+
+            int offs = fty * PBA_TILES_X + ftx;                  // 32x32 [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)
+            uint8_t v  = s->videoram_bg[offs];
+            uint8_t a  = s->colorram_bg[offs];
+
+            // code: base + bits altos (muy t pico en esta familia)
+            int code  = (int)v | ((int)(a & 0xF0) << 4);          // 0..4095 aprox
+            int color = (int)(a & 0x0F);                          // 0..15
+
+            // Pixel 4bpp
+            uint8_t pen = bg_pixel(s, code, fpx, fpy);            // 0..15 [1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
+
+            // BG normalmente NO es transparente. Si en tu PCB pen=0 debe ser transparente,
+            // descomenta el if:
+            // if (pen == 0) continue;
+
+            // Paleta BG: 4bpp (16 pens) por color (16 grupos) => 256 entradas.
+            int pal_index = (color << 4) | (pen & 0x0F);
+
+            s->logbuf[dsy * PBA_LOG_W + dsx] = pal_pen(s, pal_index);
+        }
+    }
+}
+
+static void draw_fg(PBAction* s)
+{
+    // FG: tilemap 32x32 de 8x8 => 256x256.
+    // Visible en el buffer l gico: 256x224 (PBA_LOG_W x PBA_LOG_H). [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)
+    // fg_pixel(): 8x8, 3bpp, pen 0..7 (pen 0 transparente). [1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
 
     for (int ty = 0; ty < PBA_TILES_Y; ty++) {
         for (int tx = 0; tx < PBA_TILES_X; tx++) {
             int offs = ty * PBA_TILES_X + tx;
-            int code = s->videoram_bg[offs];
-            int attr = s->colorram_bg[offs];
-            int color = attr & 0x07; // 8 grupos (según GFXDECODE_ENTRY bgchars..., 8)
 
-            int sx = tx * 8;
-            int sy = ty * 8;
+            uint8_t v = s->videoram_fg[offs];
+            uint8_t a = s->colorram_fg[offs];
 
-            for (int py = 0; py < 8; py++) {
-                int y = sy + py;
-                if (y < 0 || y >= PBA_LOG_H) continue;
-                for (int px = 0; px < 8; px++) {
-                    int x = (sx + px + scroll) & 0xFF; // wrap 256
-                    if (x < 0 || x >= PBA_LOG_W) continue;
-                    uint8_t pix = bg_pixel(s, code, px, py);
-                    int pen = 128 + color * 16 + pix; // base 128
-                    s->logbuf[y * PBA_LOG_W + x] = pal_pen(s, pen);
+            // C digo: byte base + bits altos desde el nibble alto (mapeo t pico).
+            // fg_pixel() ya enmascara a 0x7FF, as  que es seguro. [1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
+            int code  = (int)v | ((int)(a & 0xF0) << 4);
+
+            // Color: low nibble (16 grupos)
+            int color = (int)(a & 0x0F);
+
+            // Dibuja tile 8x8
+            for (int y = 0; y < PBA_TILE_H; y++) {
+                int sy = ty * PBA_TILE_H + y;
+                if (sy < 0 || sy >= PBA_LOG_H) continue; // recorte a 224 l neas visibles [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)
+
+                for (int x = 0; x < PBA_TILE_W; x++) {
+                    int sx = tx * PBA_TILE_W + x;
+                    if (sx < 0 || sx >= PBA_LOG_W) continue;
+
+                    int px = x;
+                    int py = y;
+                    int dsx = sx;
+                    int dsy = sy;
+
+                    // Flipscreen: invierte coordenadas dentro del  rea visible (256x224)
+                    if (s->flipscreen) {
+                        px  = (PBA_TILE_W - 1) - x;
+                        py  = (PBA_TILE_H - 1) - y;
+                        dsx = (PBA_LOG_W - 1) - sx;
+                        dsy = (PBA_LOG_H - 1) - sy;
+                    }
+
+                    uint8_t pen = fg_pixel(s, code, px, py); // 0..7 [1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
+                    if (pen == 0) continue; // transparencia FG
+
+                    //  ndice de paleta:
+                    // Usamos la misma  banco de 16  que BG: (color<<4)|pen.
+                    // Como pen es 0..7, encaja dentro del bloque del color. [2](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.h)[1](https://indra365-my.sharepoint.com/personal/jagsanchez_indra_es/Documents/Archivos%20de%20Microsoft%C2%A0Copilot%20Chat/pbaction.c)
+                    int pal_index = (color << 4) | (pen & 0x0F);
+
+                    s->logbuf[dsy * PBA_LOG_W + dsx] = pal_pen(s, pal_index);
                 }
             }
         }
     }
 }
 
-static void draw_fg(PBAction* s) {
-    for (int ty = 0; ty < PBA_TILES_Y; ty++) {
-        for (int tx = 0; tx < PBA_TILES_X; tx++) {
-            int offs = ty * PBA_TILES_X + tx;
-            int code = s->videoram_fg[offs];
-            int attr = s->colorram_fg[offs];
-            int color = attr & 0x0F; // 16 grupos
+// 32x32, 3bpp, layout2 real (MAME spritelayout2) usando REGION_GFX3 offset 0x01000
+// Cada sprite 32x32 ocupa 128 bytes por plano. Hay 32 sprites (0..31). [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+static uint8_t spr32_layout2_pixel(PBAction* s, int code, int x, int y)
+{
+    const int planes = 3;
+    const int plane_sz = (int)(sizeof(s->sprites) / planes);
 
-            int sx = tx * 8;
-            int sy = ty * 8;
+    // En MAME gfxdecode: REGION_GFX3, offset 0x01000 para sprites grandes [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+    const int region_off = 0x01000;
 
-            // recorte visible: 224 líneas
-            if (sy >= PBA_LOG_H) continue;
+    // 32 sprites grandes
+    code &= 0x1F;
 
-            for (int py = 0; py < 8; py++) {
-                int y = sy + py;
-                if (y < 0 || y >= PBA_LOG_H) continue;
-                for (int px = 0; px < 8; px++) {
-                    int x = sx + px;
-                    if (x < 0 || x >= PBA_LOG_W) continue;
+    // Cada sprite 32x32: 128 bytes por plano (charincrement = 128*8 bits) [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+    int sprite_base = code * 128;
 
-                    uint8_t pix = fg_pixel(s, code, px, py);
-                    if (pix == 0) continue; // transparencia pen0
-                    int pen = color * 8 + pix;
-                    s->logbuf[y * PBA_LOG_W + x] = pal_pen(s, pen);
-                }
-            }
-        }
+    // Offsets de byte por grupos segÃºn xoffset/yoffset del layout2 [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+    static const int xbyte_off[4] = { 0, 8, 32, 40 };     // 0, 8*8, 32*8, 40*8 (bits) => 0,8,32,40 bytes
+    int xb = x >> 3;                                     // 0..3
+    int bit = x & 7;                                     // 0..7 (MSB primero)
+    int xoff = xbyte_off[xb];
+
+    int yoff;
+    if (y < 8)       yoff = y;           // 0..7
+    else if (y < 16) yoff = 16 + (y-8);  // 16..23
+    else if (y < 24) yoff = 64 + (y-16); // 64..71
+    else             yoff = 80 + (y-24); // 80..87
+
+    int byte_off = sprite_base + yoff + xoff;
+
+    uint8_t pen = 0;
+    for (int pl = 0; pl < planes; pl++) {
+        const uint8_t* base = &s->sprites[pl * plane_sz + region_off];
+        uint8_t b = base[byte_off];
+        pen |= (uint8_t)(((b >> (7 - bit)) & 1) << pl);
     }
+    return pen;  // 0..7
 }
 
-static void draw_sprites(PBAction* s) {
-    // Formato aproximado: 32 sprites x 4 bytes.
-    // offs: 0..0x7C step4
-    for (int offs = 0; offs < PBA_SPRRAM_SIZE; offs += 4) {
-        uint8_t sy = s->spriteram[offs + 0];
-        uint8_t code = s->spriteram[offs + 1];
-        uint8_t attr = s->spriteram[offs + 2];
-        uint8_t sx = s->spriteram[offs + 3];
+static void draw_sprites(PBAction* s)
+{
+    // Formato real (MAME4ALL):
+    //  offs+0: CODE (bit7 = 32x32)
+    //  offs+1: ATTR (color low nibble, flipX=0x40, flipY=0x80)
+    //  offs+2: Y
+    //  offs+3: X [2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+    //
+    // Orden: de final a principio para prioridad. [2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+    for (int offs = PBA_SPRRAM_SIZE - 4; offs >= 0; offs -= 4) {
 
-        int color = attr & 0x0F;
-        bool flipx = (attr & 0x10) != 0;
-        bool flipy = (attr & 0x20) != 0;
-        bool big   = (attr & 0x80) != 0;
+        uint8_t codeb = s->spriteram[offs + 0];
+        uint8_t attr  = s->spriteram[offs + 1];
+        uint8_t yb    = s->spriteram[offs + 2];
+        uint8_t xb    = s->spriteram[offs + 3];
+
+        int big = (codeb & 0x80) ? 1 : 0;
+
+        // Si el sprite "siguiente" es doble tamaÃ±o, este se ignora. [2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+        if (offs > 0 && (s->spriteram[offs - 4] & 0x80)) continue;
+
+        int color = (attr & 0x0F);
+        int flipx = (attr & 0x40) ? 1 : 0;
+        int flipy = (attr & 0x80) ? 1 : 0;
+
+        int sx = (int)xb;
+
+        // FÃ³rmulas Y distintas para 16x16 y 32x32. [2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+        int sy = big ? (225 - (int)yb) : (241 - (int)yb);
+
+        // Flipscreen segÃºn MAME4ALL (ajustes distintos en big/normal). [2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+        if (s->flipscreen) {
+            if (big) {
+                sx = 224 - sx;
+                sy = 225 - sy;
+            } else {
+                sx = 240 - sx;
+                sy = 241 - sy;
+            }
+            flipx = !flipx;
+            flipy = !flipy;
+        }
 
         int w = big ? 32 : 16;
         int h = big ? 32 : 16;
 
-        // coordenadas típicas en tilesets: y invertida
-        int x0 = (int)sx;
-        int y0 = (int)(240 - sy); // heurística común
-
+        // Render por pÃ­xel con clipping al buffer lÃ³gico (256x224)
         for (int y = 0; y < h; y++) {
-            int yy = y0 + y;
-            if (yy < 0 || yy >= PBA_LOG_H) continue;
+            int yy = flipy ? (h - 1 - y) : y;
+            int py = sy + y;
+
+            if ((unsigned)py >= (unsigned)PBA_LOG_H) continue;
+
             for (int x = 0; x < w; x++) {
-                int xx = x0 + x;
-                if (xx < 0 || xx >= PBA_LOG_W) continue;
+                int xx = flipx ? (w - 1 - x) : x;
+                int px = sx + x;
 
-                int px = flipx ? (w - 1 - x) : x;
-                int py = flipy ? (h - 1 - y) : y;
+                if ((unsigned)px >= (unsigned)PBA_LOG_W) continue;
 
-                uint8_t pix = big ? spr32_pixel(s, code, px, py) : spr16_pixel(s, code, px, py);
-                if (pix == 0) continue;
-                int pen = color * 8 + pix;
-                s->logbuf[yy * PBA_LOG_W + xx] = pal_pen(s, pen);
+                uint8_t pen;
+                if (!big) {
+                    // sprites 16x16: 128 sprites, 3bpp [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+                    pen = spr16_pixel(s, (int)(codeb & 0x7F), xx, yy);
+                } else {
+                    // sprites 32x32: layout2 en offset 0x01000, 3bpp [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)
+                    pen = spr32_layout2_pixel(s, (int)codeb, xx, yy);
+                }
+
+                // transparencia: pen 0
+                if (pen == 0) continue;
+
+                // Paleta sprites: 16 colores * 8 pens = 128 entradas, base 0 [3](https://github.com/jv4779/openlase-mame/blob/master/xmame-0.106/src/drivers/pbaction.c)[2](https://github.com/ValveSoftware/steamlink-sdk/blob/master/examples/mame4all/src/vidhrdw/pbaction.cpp)
+                int pal_index = (color << 3) | (pen & 0x07);
+
+                s->logbuf[py * PBA_LOG_W + px] = pal_pen(s, pal_index);
             }
         }
     }
 }
+
 
 // ROT90 CW: dst(x,y) = src(x_src, y_src)
 // Si src es 256x224, dst es 224x256:
@@ -653,6 +1086,45 @@ void pbaction_init(PBAction* s) {
                                     SDL_TEXTUREACCESS_STREAMING,
                                     PBA_SCREEN_W, PBA_SCREEN_H);
 
+
+    // Audio (SDL)
+    s->audio_dev = 0;
+    s->audio_rate = 0;
+    s->audio_gain = 0.25f;
+    s->audio_enabled = false;
+    s->audio_test_tone = false;
+    s->ay_write_count = 0;
+
+    SDL_AudioSpec want;
+    SDL_AudioSpec have;
+    SDL_zero(want);
+    want.freq = 44100;
+    want.format = AUDIO_S16SYS;
+    want.channels = 1;
+    want.samples = 1024;
+    want.callback = pb_audio_callback;
+    want.userdata = s;
+
+    s->audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (s->audio_dev != 0) {
+        s->audio_rate = have.freq;
+        s->audio_enabled = true;
+
+        uint32_t base = (uint32_t)(PBA_AY_CLOCK / 16);
+        if (base == 0) base = 1;
+        g_ay_ticks_per_sample_fp = (uint32_t)(((uint64_t)base << 16) / (uint32_t)(s->audio_rate ? s->audio_rate : 44100));
+
+        for (int k = 0; k < PBA_AY_CHIPS; k++) ay_reset(&g_ay[k]);
+        g_hp_prev_x = g_hp_prev_y = 0.0f;
+        g_ay_data_writes = 0;
+        g_any_nonzero_vol = 0;
+
+        SDL_PauseAudioDevice(s->audio_dev, 0);
+        fprintf(stderr, "[AUDIO] SDL freq=%dHz, AY base=%u -> ticks_fp=%u\n", s->audio_rate, base, g_ay_ticks_per_sample_fp);
+    } else {
+        fprintf(stderr, "[AUDIO] No se pudo abrir dispositivo SDL: %s\n", SDL_GetError());
+    }
+
     // CPUs
     z80_init(&s->maincpu);
     s->maincpu.userdata   = s;
@@ -675,6 +1147,7 @@ void pbaction_init(PBAction* s) {
 }
 
 void pbaction_shutdown(PBAction* s) {
+    if (s->audio_dev) { SDL_CloseAudioDevice(s->audio_dev); s->audio_dev = 0; }
     if (s->texture)  SDL_DestroyTexture(s->texture);
     if (s->renderer) SDL_DestroyRenderer(s->renderer);
     if (s->window)   SDL_DestroyWindow(s->window);
@@ -694,7 +1167,7 @@ void pbaction_run_frame(PBAction* s) {
     int cyc_main  = cycles_per_frame(PBA_MAIN_HZ);
     int cyc_audio = cycles_per_frame(PBA_AUDIO_HZ);
 
-    // Ejecutar de forma intercalada para aproximar sincronía
+    // Ejecutar de forma intercalada para aproximar sincron a
     while (cyc_main > 0 || cyc_audio > 0) {
         if (cyc_main > 0) {
             int ran = z80_step(&s->maincpu);
@@ -740,7 +1213,7 @@ static inline void set_bit(uint8_t* v, uint8_t mask, bool pressed) {
 }
 
 void pbaction_handle_key(PBAction* s, SDL_Scancode sc, bool pressed) {
-    // P1/P2: según MAME: botones 1..4 en bits 0x08,0x10,0x01,0x04 (P1)
+    // P1/P2: seg n MAME: botones 1..4 en bits 0x08,0x10,0x01,0x04 (P1)
     switch (sc) {
         case SDL_SCANCODE_Z:   set_bit(&s->in_p1, 0x08, pressed); break; // button1
         case SDL_SCANCODE_X:   set_bit(&s->in_p1, 0x10, pressed); break; // button2
@@ -752,13 +1225,34 @@ void pbaction_handle_key(PBAction* s, SDL_Scancode sc, bool pressed) {
         case SDL_SCANCODE_5:   set_bit(&s->in_sys, 0x01, pressed); break; // coin1
         case SDL_SCANCODE_6:   set_bit(&s->in_sys, 0x02, pressed); break; // coin2
 
-        case SDL_SCANCODE_TAB:
-            if (pressed) s->turbo = !s->turbo;
-            break;
-
         case SDL_SCANCODE_ESCAPE:
             if (pressed) s->quit = true;
             break;
+
+        // Audio test tone (debug)
+        case SDL_SCANCODE_F3:
+            if (pressed) {
+                s->audio_test_tone = !s->audio_test_tone;
+                fprintf(stderr, "[AUDIO] test_tone=%d\n", s->audio_test_tone ? 1 : 0);
+            }
+            return;
+
+        // Gain toggle
+        case SDL_SCANCODE_F4:
+            if (pressed) {
+                s->audio_gain = (s->audio_gain < 0.9f) ? 1.0f : 0.25f;
+                fprintf(stderr, "[AUDIO] gain=%.2f\n", s->audio_gain);
+            }
+            return;
+
+		// Turbo
+		case SDL_SCANCODE_F2:
+			if (pressed) {
+				s->turbo = !s->turbo;
+				//if (!t->turbo_mode && t->audio_dev > 0) SDL_ClearQueuedAudio(t->audio_dev);
+				printf("[EMU] Velocidad %s\n", s->turbo ? "MAXIMA" : "normal");
+			}
+			return;
 
         default:
             break;
@@ -782,6 +1276,8 @@ static void usage(const char* exe) {
     printf("  5/6     = coin1/coin2\n");
     printf("  1/2     = start1/start2\n");
     printf("  TAB     = turbo\n");
+    printf("  F3      = audio test tone (debug)\n");
+    printf("  F4      = toggle gain 0.25/1.00\n");
     printf("  ESC     = salir\n");
 }
 
@@ -794,7 +1290,7 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "Opción desconocida: %s\n", argv[i]);
+            fprintf(stderr, "Opci n desconocida: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
