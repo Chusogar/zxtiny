@@ -17,13 +17,6 @@ static const uint32_t palette[16] = {
     0xFF00FF00, 0xFF00FFFF, 0xFFFFFF00, 0xFFFFFFFF
 };
 
-// Tabla de volumen AY (aprox. logarítmica)
-static const float ay_vol[16] = {
-    0.0f, 0.004f, 0.006f, 0.009f,
-    0.013f, 0.019f, 0.028f, 0.041f,
-    0.060f, 0.088f, 0.129f, 0.189f,
-    0.276f, 0.403f, 0.587f, 0.857f
-};
 
 // -----------------------------------------------------------------------------
 // Helpers memoria paginada
@@ -34,154 +27,6 @@ static inline uint8_t* page_ptr(ZXSpectrum* s, uint16_t addr) {
 
 static inline uint8_t mem_peek(ZXSpectrum* s, uint16_t addr) {
     return page_ptr(s, addr)[addr & 0x3FFF];
-}
-
-// -----------------------------------------------------------------------------
-// AY-3-8912
-// -----------------------------------------------------------------------------
-static void ay_reset(AYState* a) {
-    memset(a, 0, sizeof(*a));
-    a->lfsr = 0x1FFFF; // 17-bit
-    a->noise_out = 1;
-    for (int i = 0; i < 3; i++) {
-        a->tone_out[i] = 1;
-        a->tone_count[i] = 1;
-        a->tone_period[i] = 1;
-    }
-    a->noise_count = 1;
-    a->noise_period = 1;
-    a->env_period = 1;
-    a->env_count = 1;
-    a->env_vol = 0;
-    a->last_sample = 0.0f;
-}
-
-static void ay_env_restart(AYState* a, uint8_t shape) {
-    a->env_continue = (shape >> 3) & 1;
-    a->env_attack   = (shape >> 2) & 1;
-    a->env_alt      = (shape >> 1) & 1;
-    a->env_hold     = (shape >> 0) & 1;
-
-    a->env_step = a->env_attack ? 1 : -1;
-    a->env_vol  = a->env_attack ? 0 : 15;
-    a->env_count = a->env_period ? a->env_period : 1;
-}
-
-static void ay_write_reg(AYState* a, uint8_t reg, uint8_t val) {
-    reg &= 0x0F;
-
-    static const uint8_t masks[16] = {
-        0xFF, 0x0F, 0xFF, 0x0F, 0xFF, 0x0F, 0x1F, 0xFF,
-        0x1F, 0x1F, 0x1F, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF
-    };
-    val &= masks[reg];
-
-    a->regs[reg] = val;
-
-    a->tone_period[0] = (uint16_t)a->regs[0] | ((uint16_t)(a->regs[1] & 0x0F) << 8);
-    a->tone_period[1] = (uint16_t)a->regs[2] | ((uint16_t)(a->regs[3] & 0x0F) << 8);
-    a->tone_period[2] = (uint16_t)a->regs[4] | ((uint16_t)(a->regs[5] & 0x0F) << 8);
-    if (a->tone_period[0] == 0) a->tone_period[0] = 1;
-    if (a->tone_period[1] == 0) a->tone_period[1] = 1;
-    if (a->tone_period[2] == 0) a->tone_period[2] = 1;
-
-    a->noise_period = a->regs[6] & 0x1F;
-    if (a->noise_period == 0) a->noise_period = 1;
-
-    a->env_period = (uint16_t)a->regs[11] | ((uint16_t)a->regs[12] << 8);
-    if (a->env_period == 0) a->env_period = 1;
-
-    if (reg == 13) ay_env_restart(a, val);
-}
-
-static inline void ay_step_envelope(AYState* a) {
-    int nv = (int)a->env_vol + (int)a->env_step;
-
-    if (nv < 0 || nv > 15) {
-        if (!a->env_continue) {
-            a->env_vol = 0;
-            a->env_step = 0;
-            return;
-        }
-        if (a->env_hold) {
-            a->env_vol = (a->env_step > 0) ? 15 : 0;
-            a->env_step = 0;
-            return;
-        }
-        if (a->env_alt) a->env_step = (int8_t)(-a->env_step);
-        a->env_vol = (a->env_step > 0) ? 0 : 15;
-        return;
-    }
-
-    a->env_vol = (uint8_t)nv;
-}
-
-static void ay_step_ticks(AYState* a, uint32_t ticks) {
-    for (uint32_t t = 0; t < ticks; t++) {
-        a->div16++;
-        if (a->div16 >= 16) {
-            a->div16 = 0;
-
-            for (int ch = 0; ch < 3; ch++) {
-                if (a->tone_count[ch] == 0) a->tone_count[ch] = a->tone_period[ch];
-                a->tone_count[ch]--;
-                if (a->tone_count[ch] == 0) {
-                    a->tone_out[ch] ^= 1;
-                    a->tone_count[ch] = a->tone_period[ch];
-                }
-            }
-
-            if (a->noise_count == 0) a->noise_count = a->noise_period;
-            a->noise_count--;
-            if (a->noise_count == 0) {
-                uint32_t bit = (a->lfsr ^ (a->lfsr >> 3)) & 1;
-                a->lfsr = (a->lfsr >> 1) | (bit << 16);
-                a->noise_out = (uint8_t)(a->lfsr & 1);
-                a->noise_count = a->noise_period;
-            }
-        }
-
-        a->div256++;
-        if (a->div256 >= 256) {
-            a->div256 = 0;
-            if (a->env_count == 0) a->env_count = a->env_period;
-            a->env_count--;
-            if (a->env_count == 0) {
-                a->env_count = a->env_period;
-                ay_step_envelope(a);
-            }
-        }
-    }
-}
-
-static void ay_step_tstates(AYState* a, uint32_t tstates) {
-    uint64_t add = (uint64_t)tstates * (uint64_t)AY_CLOCK_HZ;
-    uint64_t acc = (uint64_t)a->tick_accum + add;
-    uint32_t ticks = (uint32_t)(acc / ZX_CPU_CLOCK_HZ);
-    a->tick_accum = (uint32_t)(acc % ZX_CPU_CLOCK_HZ);
-    if (ticks) ay_step_ticks(a, ticks);
-}
-
-static float ay_mix(AYState* a) {
-    uint8_t mixer = a->regs[7];
-
-    float sum = 0.0f;
-    for (int ch = 0; ch < 3; ch++) {
-        int tone_en  = ((mixer >> ch) & 1) ? 0 : 1;
-        int noise_en = ((mixer >> (ch + 3)) & 1) ? 0 : 1;
-
-        int tone_ok  = tone_en  ? a->tone_out[ch] : 1;
-        int noise_ok = noise_en ? a->noise_out    : 1;
-
-        uint8_t vr = a->regs[8 + ch];
-        uint8_t v = (vr & 0x10) ? a->env_vol : (vr & 0x0F);
-        float amp = ay_vol[v & 0x0F];
-
-        float s = (tone_ok && noise_ok) ? amp : 0.0f;
-        sum += s;
-    }
-
-    return (sum / 3.0f) * 0.9f;
 }
 
 // -----------------------------------------------------------------------------
@@ -228,13 +73,35 @@ static inline void spectrum_update_memory_map(ZXSpectrum* s) {
         return;
     }
 
+	if (s->model == ZX_MODEL_PENTA1024) {
+        s->mem_map[1] = s->ram[5];
+        s->mem_map[2] = s->ram[2];
+
+        s->mem_map[3] = s->ram[0];
+
+        // ROM overlay: bit0 de 1FFD = RAM page 0 en 0x0000-0x3FFF
+        if (s->port_1ffd & 0x01) {
+            s->mem_map[0] = s->ram[0];
+        } else if (s->beta_active && s->have_rom_beta) {
+            s->mem_map[0] = s->rom_beta;
+        } else if (s->port_1ffd & 0x02) {
+            // Scorpion service ROM
+            s->mem_map[0] = s->have_rom_scorpion_service
+                            ? s->rom_scorpion_service : s->rom48;
+        } else {
+            //s->mem_map[0] = s->have_rom128 ? s->rom128[s->rom_page & 1] : s->rom48;
+			s->mem_map[0] = s->have_rom128 ? s->rom_scorpion_service : s->rom48;
+        }
+        return;
+    }
+
     if (s->model == ZX_MODEL_SCORPION) {
         s->mem_map[1] = s->ram[5];
         s->mem_map[2] = s->ram[2];
 
         // Scorpion 256K: bit4 de 1FFD extiende bancos 8-15
         int bank = s->bank_c000 & 7;
-        if (s->port_1ffd & 0x10) bank |= 8; // bancos 8-15
+        if (s->port_1ffd & 0x10) bank += 8; // bancos 8-15
         s->mem_map[3] = s->ram[bank & 15];
 
         // ROM overlay: bit0 de 1FFD = RAM page 0 en 0x0000-0x3FFF
@@ -249,6 +116,22 @@ static inline void spectrum_update_memory_map(ZXSpectrum* s) {
         } else {
             s->mem_map[0] = s->have_rom128 ? s->rom128[s->rom_page & 1] : s->rom48;
         }
+#if 0
+		int _rom_p = ((s->port_7ffd >> 4) & 0x1)+((s->port_1ffd  >> 1) & 0x2);
+		printf("ROM_:%d\n", _rom_p);
+		
+		if (_rom_p<2)
+		{
+			s->mem_map[0] = s->rom128[_rom_p];
+		} else if (_rom_p==3)
+		{
+			s->mem_map[0] = s->rom_scorpion_service;
+		} else {
+			s->mem_map[0] = s->rom_beta;
+		}
+
+#endif		
+
         return;
     }
 
@@ -277,7 +160,7 @@ static inline void spectrum_apply_7ffd_force(ZXSpectrum* s, uint8_t val) {
     if (val & 0x20) s->paging_lock = true;
 
     if (s->model == ZX_MODEL_128K || s->model == ZX_MODEL_PENTAGON ||
-        s->model == ZX_MODEL_SCORPION) {
+        s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION) {
         s->rom_page = (val & 0x10) ? 1 : 0;
     } else if (s->model == ZX_MODEL_PLUS3) {
         s->rom_page = plus3_rom_index(s->port_7ffd, s->port_1ffd);
@@ -289,12 +172,19 @@ static inline void spectrum_apply_7ffd_force(ZXSpectrum* s, uint8_t val) {
 }
 
 static inline void spectrum_write_7ffd(ZXSpectrum* s, uint8_t val) {
+	s->port_7ffd = val;
+
     if (s->model == ZX_MODEL_48K) return;
     if (s->paging_lock && s->model != ZX_MODEL_SCORPION) return;
     if (s->paging_lock && s->model == ZX_MODEL_SCORPION) {
         // Scorpion: paging_lock bloquea 7FFD pero no 1FFD
         return;
     }
+
+	int _num_rom = ((s->port_7ffd>>4) & 0x01);
+	printf("ROM: %d\n", _num_rom);
+			
+
     spectrum_apply_7ffd_force(s, val);
 }
 
@@ -332,7 +222,7 @@ static inline int is_3ffd(uint16_t port) { return (port == 0x3FFD); }
 // Contención de memoria (aprox)
 // -----------------------------------------------------------------------------
 static inline bool bank_is_contended(ZXSpectrum* s, int bank) {
-    if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION)
+    if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION)
         return false; // Pentagon/Scorpion no tienen contención
     if (s->model == ZX_MODEL_PLUS3) return (bank >= 4 && bank <= 7);
     return (bank == 5 || bank == 7);
@@ -350,7 +240,7 @@ static void ula_setup_clash(ZXSpectrum* s) {
     memset(s->ula_clash, 0, sizeof(s->ula_clash));
 
     // Pentagon/Scorpion: sin contención de memoria
-    if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION)
+    if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION)
         return;
 
     static const uint8_t pattern[8] = {6,5,4,3,2,1,0,0};
@@ -519,6 +409,27 @@ static inline int is_scorpion_1ffd(uint16_t port) {
 static uint8_t port_in(z80* z, uint16_t port) {
     ZXSpectrum* s = (ZXSpectrum*)z->userdata;
 
+	if((port&0xff)!=0xfe)
+		printf("port: %d\n", (port&0xff));
+
+	if ((port&0xff) == 223 || (port&0xff) == 31)
+	{
+		printf("kempston!!!!");
+	}
+
+	// Scorpion: lectura de puerto $BF pagina la ROM TR-DOS (matching YASE)
+    if (s->model == ZX_MODEL_SCORPION && (port & 0xFF) == 0xBF && !s->beta_active) {
+        s->beta_active = true;
+        spectrum_update_memory_map(s);
+        return (s->port_7ffd & 0x08) ? 0xFF : 0x7F;
+    }
+
+    // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
+    if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION) &&
+         is_beta_port(port)) {
+        return beta128_read(&s->beta, port);
+    }
+
 	//printf("Read PORT %d\n", port);
 
     if (!(port & 1) || addr_contended(s, port)) {
@@ -540,9 +451,9 @@ static uint8_t port_in(z80* z, uint16_t port) {
         return result;
     }
 
-    // AY lectura (128K, +3, Pentagon, Scorpion)
+    // AY lectura (128K, +3, Pentagon, Pentagon1024, Scorpion)
     if ((s->model != ZX_MODEL_48K) && is_fffd(port)) {
-        return s->ay.regs[s->ay.sel & 0x0F];
+        return ay8910_read(&s->ay);
     }
 
     // +3 FDC: puerto 0x2FFD = status, 0x3FFD = data
@@ -551,21 +462,10 @@ static uint8_t port_in(z80* z, uint16_t port) {
         if (is_3ffd(port)) return fdc_read_data(&s->fdc);
     }
 
-    // Scorpion: lectura de puerto $BF pagina la ROM TR-DOS (matching YASE)
-    if (s->model == ZX_MODEL_SCORPION && (port & 0xFF) == 0xBF && !s->beta_active) {
-        s->beta_active = true;
-        spectrum_update_memory_map(s);
-        return (s->port_7ffd & 0x08) ? 0xFF : 0x7F;
-    }
-
-    // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
-    if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
-        s->beta_active && is_beta_port(port)) {
-        return beta128_read(&s->beta, port);
-    }
+    
 
     // Kempston
-    //if ((port & 0xE0) == 0) return s->kempston;
+    if ((port & 0xE0) == 0 || (port & 0xFF) == 0xDF) return s->kempston;
 
     // Floating bus
     return (uint8_t)(ula_recv_floating(s) & 0xFF);
@@ -588,7 +488,7 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
         return;
     }
 
-    // 7FFD (128K, +3, Pentagon, Scorpion)
+    // 7FFD (128K, +3, Pentagon, Pentagon1024, Scorpion)
     if (s->model != ZX_MODEL_48K && is_7ffd(port)) {
         spectrum_write_7ffd(s, val);
         return;
@@ -606,10 +506,10 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
         return;
     }
 
-    // AY (128K, +3, Pentagon, Scorpion)
+    // AY (128K, +3, Pentagon, Pentagon1024, Scorpion)
     if (s->model != ZX_MODEL_48K) {
-        if (is_fffd(port)) { s->ay.sel = val & 0x0F; return; }
-        if (is_bffd(port)) { ay_write_reg(&s->ay, s->ay.sel, val); return; }
+        if (is_fffd(port)) { ay8910_select(&s->ay, val); return; }
+        if (is_bffd(port)) { ay8910_write_selected(&s->ay, val); return; }
     }
 
     // FDC data write (0x3FFD) - +3
@@ -619,8 +519,8 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
     }
 
     // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
-    if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
-        s->beta_active && is_beta_port(port)) {
+    if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION) &&
+        is_beta_port(port)) {
         beta128_write(&s->beta, port, val);
         return;
     }
@@ -800,6 +700,12 @@ static void spectrum_set_model_defaults(ZXSpectrum* s, ZXModel model) {
         s->ula_lines_per_frame  = 314;
         s->ula_ticks_per_frame  = 71680;
         s->ula_chars_per_line   = 57;
+    } else if (model == ZX_MODEL_PENTA1024) {
+        // Pentagon: 228 T-states/line, 71680 T-states/frame (matching YASE)
+        s->ula_tstates_per_line = 228;
+        s->ula_lines_per_frame  = 314;
+        s->ula_ticks_per_frame  = 71680;
+        s->ula_chars_per_line   = 57;
     } else {
         // 128K, +3, Scorpion: 228 T-states/line, 311 lines
         s->ula_tstates_per_line = 228;
@@ -816,10 +722,12 @@ static void spectrum_set_model_defaults(ZXSpectrum* s, ZXModel model) {
     s->rom_page = 0;
     s->beta_active = false;
 
+	s->kempston = 0;
+
     spectrum_update_memory_map(s);
     ula_setup_clash(s);
 
-    ay_reset(&s->ay);
+    ay8910_reset(&s->ay, ZX_CPU_CLOCK_HZ, AY_CLOCK_HZ);
     fdc_init(&s->fdc);
     beta128_init(&s->beta);
 }
@@ -847,6 +755,7 @@ void spectrum_init(ZXSpectrum* s, ZXModel model) {
     }
 
     const char* title = (model == ZX_MODEL_PENTAGON) ? "Pentagon 128" :
+                        (model == ZX_MODEL_PENTA1024) ? "Pentagon 1024" :
                         (model == ZX_MODEL_SCORPION) ? "Scorpion ZS 256" :
                         (model == ZX_MODEL_PLUS3) ? "ZX Spectrum +3" :
                         (model == ZX_MODEL_128K) ? "ZX Spectrum 128K" : "ZX Spectrum 48K";
@@ -1224,7 +1133,7 @@ void spectrum_run_frame(ZXSpectrum* s) {
         // Activación: PC en $3D00-$3DFF y ROM 1 (48K BASIC) paginada.
         // Desactivación: PC >= $4000 y TR-DOS ROM activa.
         // Port $BF (Scorpion): activación incondicional (en port_in).
-        if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
+        if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION) &&
             s->have_rom_beta) {
             uint16_t pc = s->cpu.pc;
             if (pc >= 0x4000 && s->beta_active) {
@@ -1268,7 +1177,7 @@ void spectrum_run_frame(ZXSpectrum* s) {
         }
 
         // Beta 128 (Pentagon/Scorpion): actualización
-        if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) {
+        if (s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_PENTA1024 || s->model == ZX_MODEL_SCORPION) {
 			beta128_tick(&s->beta, total);
         }
 
@@ -1279,9 +1188,9 @@ void spectrum_run_frame(ZXSpectrum* s) {
                 prev_sample_at = next_sample_at;
 
                 if (s->model != ZX_MODEL_48K)
-                    ay_step_tstates(&s->ay, (uint32_t)delta_t);
+                    ay8910_step_tstates(&s->ay, (uint32_t)delta_t);
 
-                float ay_out = (s->model != ZX_MODEL_48K) ? ay_mix(&s->ay) : 0.0f;
+                float ay_out = (s->model != ZX_MODEL_48K) ? ay8910_mix(&s->ay) : 0.0f;
 
                 float level = 0.0f;
                 if (s->ear_bit) level += 0.12f;
@@ -1343,6 +1252,7 @@ static void print_usage(const char* exe) {
     printf("  --128k      ZX Spectrum 128K (paginación 0x7FFD + AY)\n");
     printf("  --plus3     ZX Spectrum +3 (0x7FFD+0x1FFD, FDC uPD765, .dsk)\n");
     printf("  --pentagon  Pentagon 128 (Beta 128, WD1793, .trd/.scl)\n");
+	printf("  --penta1024  Pentagon 1024 (Beta 128, WD1793, .trd/.scl)\n");
     printf("  --scorpion  Scorpion ZS 256 (256KB RAM, Beta 128, .trd/.scl)\n");
 
     printf("\nFormatos aceptados:\n");
@@ -1350,8 +1260,8 @@ static void print_usage(const char* exe) {
     printf("  .tap  Cinta TAP\n");
     printf("  .tzx  Cinta TZX\n");
     printf("  .dsk  Imagen de disco Amstrad/+3 (sólo --plus3)\n");
-    printf("  .trd  Imagen de disco TR-DOS (sólo --pentagon/--scorpion)\n");
-    printf("  .scl  Contenedor SCL TR-DOS (sólo --pentagon/--scorpion)\n");
+    printf("  .trd  Imagen de disco TR-DOS (sólo --pentagon/--penta1024/--scorpion)\n");
+    printf("  .scl  Contenedor SCL TR-DOS (sólo --pentagon/--penta1024/--scorpion)\n");
 
     printf("\nROMs esperadas:\n");
     printf("  zx48.rom              (16KB)  ZX Spectrum 48K\n");
@@ -1360,6 +1270,7 @@ static void print_usage(const char* exe) {
     printf("  128tr.rom             (16KB)  Pentagon 128K BASIC\n");
     printf("  zx128_1.rom           (16KB)  Pentagon 48K BASIC\n");
     printf("  trdos.rom             (16KB)  Pentagon TR-DOS\n");
+	printf("  gluck.rom             (16KB)  Pentagon 1024 (Service)\n");
     printf("  scorp0.rom            (16KB)  Scorpion ROM 0 (128K editor)\n");
     printf("  scorp1.rom            (16KB)  Scorpion ROM 1 (48K BASIC)\n");
     printf("  scorp2.rom            (16KB)  Scorpion ROM 2 (Service monitor)\n");
@@ -1387,6 +1298,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--48k") == 0) model = ZX_MODEL_48K;
         else if (strcmp(argv[i], "--plus3") == 0) model = ZX_MODEL_PLUS3;
         else if (strcmp(argv[i], "--pentagon") == 0) model = ZX_MODEL_PENTAGON;
+        else if (strcmp(argv[i], "--penta1024") == 0) model = ZX_MODEL_PENTA1024;
         else if (strcmp(argv[i], "--scorpion") == 0) model = ZX_MODEL_SCORPION;
         else if (argv[i][0] == '-' && argv[i][1] == '-') {
             print_usage(argv[0]);
@@ -1483,6 +1395,43 @@ int main(int argc, char* argv[]) {
         spectrum_update_memory_map(&spec);
     }
 
+	// Pentagon 1024: ROMs individuales matching YASE
+    //   128p-0.rom → ROM slot 0 (128K editor)
+    //   128p-1.rom → ROM slot 1 (48K BASIC)
+    //   trdos.rom → ROM slot 2 (Service monitor)
+    //   gluck.rom → ROM slot 3 (TR-DOS)
+    if (model == ZX_MODEL_PENTA1024) {
+        bool rom_ok = true;
+        if (load16k(spec.rom128[0], "128p-0.rom") == 0) {
+            printf("[ROM] Pentagon1024 ROM 0: scorp0.rom\n");
+        } else {
+            printf("Aviso: '128p-0.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (load16k(spec.rom128[1], "128p-1.rom") == 0) {
+            printf("[ROM] Pentagon1024 ROM 1: scorp1.rom\n");
+        } else {
+            printf("Aviso: '128p-1.rom' no encontrada.\n");
+            rom_ok = false;
+        }
+        if (rom_ok) spec.have_rom128 = true;
+
+        if (load16k(spec.rom_scorpion_service, "gluck.rom") == 0) {
+            spec.have_rom_scorpion_service = true;
+            printf("[ROM] Pentagon1024 ROM 2 (service): gluck.rom\n");
+        } else {
+            printf("Aviso: 'gluck.rom' no encontrada.\n");
+        }
+        if (load16k(spec.rom_beta, "trdos.rom") == 0) {
+            spec.have_rom_beta = true;
+            printf("[ROM] Pentagon1024 ROM 3 (TR-DOS): trdos.rom\n");
+        } else {
+            printf("Aviso: 'trdos.rom' no encontrada.\n");
+        }
+        beta128_reset(&spec.beta);
+        spectrum_apply_7ffd_force(&spec, 0x00);
+    }
+
     // Montaje de discos DSK: A luego B
     int drive_to_mount = 0;
 
@@ -1517,8 +1466,8 @@ int main(int argc, char* argv[]) {
                 printf("[DSK] ERROR montando disco en unidad %c: %s\n", drive ? 'B' : 'A', file);
             }
         } else if (ext_eq(file, ".trd")) {
-            if (model != ZX_MODEL_PENTAGON && model != ZX_MODEL_SCORPION) {
-                printf("[TRD] Ignorado: sólo disponible en --pentagon o --scorpion\n");
+            if (model != ZX_MODEL_PENTAGON && model != ZX_MODEL_PENTA1024 && model != ZX_MODEL_SCORPION) {
+                printf("[TRD] Ignorado: sólo disponible en --pentagon, --penta1024 o --scorpion\n");
                 continue;
             }
             int drive = (drive_to_mount >= BETA_MAX_DRIVES) ? 0 : drive_to_mount;
@@ -1529,8 +1478,8 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[TRD] ERROR montando disco: %s\n", file);
             }
         } else if (ext_eq(file, ".scl")) {
-            if (model != ZX_MODEL_PENTAGON && model != ZX_MODEL_SCORPION) {
-                printf("[SCL] Ignorado: sólo disponible en --pentagon o --scorpion\n");
+            if (model != ZX_MODEL_PENTAGON && model != ZX_MODEL_PENTA1024 && model != ZX_MODEL_SCORPION) {
+                printf("[SCL] Ignorado: sólo disponible en --pentagon --penta1024 o --scorpion\n");
                 continue;
             }
             int drive = (drive_to_mount >= BETA_MAX_DRIVES) ? 0 : drive_to_mount;
