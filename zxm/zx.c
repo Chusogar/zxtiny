@@ -17,6 +17,13 @@ static const uint32_t palette[16] = {
     0xFF00FF00, 0xFF00FFFF, 0xFFFFFF00, 0xFFFFFFFF
 };
 
+// Tabla de volumen AY (aprox. logarítmica)
+static const float ay_vol[16] = {
+    0.0f, 0.004f, 0.006f, 0.009f,
+    0.013f, 0.019f, 0.028f, 0.041f,
+    0.060f, 0.088f, 0.129f, 0.189f,
+    0.276f, 0.403f, 0.587f, 0.857f
+};
 
 // -----------------------------------------------------------------------------
 // Helpers memoria paginada
@@ -27,6 +34,154 @@ static inline uint8_t* page_ptr(ZXSpectrum* s, uint16_t addr) {
 
 static inline uint8_t mem_peek(ZXSpectrum* s, uint16_t addr) {
     return page_ptr(s, addr)[addr & 0x3FFF];
+}
+
+// -----------------------------------------------------------------------------
+// AY-3-8912
+// -----------------------------------------------------------------------------
+static void ay_reset(AYState* a) {
+    memset(a, 0, sizeof(*a));
+    a->lfsr = 0x1FFFF; // 17-bit
+    a->noise_out = 1;
+    for (int i = 0; i < 3; i++) {
+        a->tone_out[i] = 1;
+        a->tone_count[i] = 1;
+        a->tone_period[i] = 1;
+    }
+    a->noise_count = 1;
+    a->noise_period = 1;
+    a->env_period = 1;
+    a->env_count = 1;
+    a->env_vol = 0;
+    a->last_sample = 0.0f;
+}
+
+static void ay_env_restart(AYState* a, uint8_t shape) {
+    a->env_continue = (shape >> 3) & 1;
+    a->env_attack   = (shape >> 2) & 1;
+    a->env_alt      = (shape >> 1) & 1;
+    a->env_hold     = (shape >> 0) & 1;
+
+    a->env_step = a->env_attack ? 1 : -1;
+    a->env_vol  = a->env_attack ? 0 : 15;
+    a->env_count = a->env_period ? a->env_period : 1;
+}
+
+static void ay_write_reg(AYState* a, uint8_t reg, uint8_t val) {
+    reg &= 0x0F;
+
+    static const uint8_t masks[16] = {
+        0xFF, 0x0F, 0xFF, 0x0F, 0xFF, 0x0F, 0x1F, 0xFF,
+        0x1F, 0x1F, 0x1F, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF
+    };
+    val &= masks[reg];
+
+    a->regs[reg] = val;
+
+    a->tone_period[0] = (uint16_t)a->regs[0] | ((uint16_t)(a->regs[1] & 0x0F) << 8);
+    a->tone_period[1] = (uint16_t)a->regs[2] | ((uint16_t)(a->regs[3] & 0x0F) << 8);
+    a->tone_period[2] = (uint16_t)a->regs[4] | ((uint16_t)(a->regs[5] & 0x0F) << 8);
+    if (a->tone_period[0] == 0) a->tone_period[0] = 1;
+    if (a->tone_period[1] == 0) a->tone_period[1] = 1;
+    if (a->tone_period[2] == 0) a->tone_period[2] = 1;
+
+    a->noise_period = a->regs[6] & 0x1F;
+    if (a->noise_period == 0) a->noise_period = 1;
+
+    a->env_period = (uint16_t)a->regs[11] | ((uint16_t)a->regs[12] << 8);
+    if (a->env_period == 0) a->env_period = 1;
+
+    if (reg == 13) ay_env_restart(a, val);
+}
+
+static inline void ay_step_envelope(AYState* a) {
+    int nv = (int)a->env_vol + (int)a->env_step;
+
+    if (nv < 0 || nv > 15) {
+        if (!a->env_continue) {
+            a->env_vol = 0;
+            a->env_step = 0;
+            return;
+        }
+        if (a->env_hold) {
+            a->env_vol = (a->env_step > 0) ? 15 : 0;
+            a->env_step = 0;
+            return;
+        }
+        if (a->env_alt) a->env_step = (int8_t)(-a->env_step);
+        a->env_vol = (a->env_step > 0) ? 0 : 15;
+        return;
+    }
+
+    a->env_vol = (uint8_t)nv;
+}
+
+static void ay_step_ticks(AYState* a, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; t++) {
+        a->div16++;
+        if (a->div16 >= 16) {
+            a->div16 = 0;
+
+            for (int ch = 0; ch < 3; ch++) {
+                if (a->tone_count[ch] == 0) a->tone_count[ch] = a->tone_period[ch];
+                a->tone_count[ch]--;
+                if (a->tone_count[ch] == 0) {
+                    a->tone_out[ch] ^= 1;
+                    a->tone_count[ch] = a->tone_period[ch];
+                }
+            }
+
+            if (a->noise_count == 0) a->noise_count = a->noise_period;
+            a->noise_count--;
+            if (a->noise_count == 0) {
+                uint32_t bit = (a->lfsr ^ (a->lfsr >> 3)) & 1;
+                a->lfsr = (a->lfsr >> 1) | (bit << 16);
+                a->noise_out = (uint8_t)(a->lfsr & 1);
+                a->noise_count = a->noise_period;
+            }
+        }
+
+        a->div256++;
+        if (a->div256 >= 256) {
+            a->div256 = 0;
+            if (a->env_count == 0) a->env_count = a->env_period;
+            a->env_count--;
+            if (a->env_count == 0) {
+                a->env_count = a->env_period;
+                ay_step_envelope(a);
+            }
+        }
+    }
+}
+
+static void ay_step_tstates(AYState* a, uint32_t tstates) {
+    uint64_t add = (uint64_t)tstates * (uint64_t)AY_CLOCK_HZ;
+    uint64_t acc = (uint64_t)a->tick_accum + add;
+    uint32_t ticks = (uint32_t)(acc / ZX_CPU_CLOCK_HZ);
+    a->tick_accum = (uint32_t)(acc % ZX_CPU_CLOCK_HZ);
+    if (ticks) ay_step_ticks(a, ticks);
+}
+
+static float ay_mix(AYState* a) {
+    uint8_t mixer = a->regs[7];
+
+    float sum = 0.0f;
+    for (int ch = 0; ch < 3; ch++) {
+        int tone_en  = ((mixer >> ch) & 1) ? 0 : 1;
+        int noise_en = ((mixer >> (ch + 3)) & 1) ? 0 : 1;
+
+        int tone_ok  = tone_en  ? a->tone_out[ch] : 1;
+        int noise_ok = noise_en ? a->noise_out    : 1;
+
+        uint8_t vr = a->regs[8 + ch];
+        uint8_t v = (vr & 0x10) ? a->env_vol : (vr & 0x0F);
+        float amp = ay_vol[v & 0x0F];
+
+        float s = (tone_ok && noise_ok) ? amp : 0.0f;
+        sum += s;
+    }
+
+    return (sum / 3.0f) * 0.9f;
 }
 
 // -----------------------------------------------------------------------------
@@ -453,7 +608,7 @@ static uint8_t port_in(z80* z, uint16_t port) {
 
     // AY lectura (128K, +3, Pentagon, Pentagon1024, Scorpion)
     if ((s->model != ZX_MODEL_48K) && is_fffd(port)) {
-        return ay8910_read(&s->ay);
+        return s->ay.regs[s->ay.sel & 0x0F];
     }
 
     // +3 FDC: puerto 0x2FFD = status, 0x3FFD = data
@@ -508,8 +663,8 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
 
     // AY (128K, +3, Pentagon, Pentagon1024, Scorpion)
     if (s->model != ZX_MODEL_48K) {
-        if (is_fffd(port)) { ay8910_select(&s->ay, val); return; }
-        if (is_bffd(port)) { ay8910_write_selected(&s->ay, val); return; }
+        if (is_fffd(port)) { s->ay.sel = val & 0x0F; return; }
+        if (is_bffd(port)) { ay_write_reg(&s->ay, s->ay.sel, val); return; }
     }
 
     // FDC data write (0x3FFD) - +3
@@ -527,139 +682,14 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
 }
 
 // -----------------------------------------------------------------------------
-// Reproductor TAP por pulsos
+// Reproductor TAP (delegado en tap_file.c)
 // -----------------------------------------------------------------------------
 int spectrum_load_tap(ZXSpectrum* s, const char* filename) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return -1; }
-
-    free(s->tap.data);
-    s->tap.data = (uint8_t*)malloc((size_t)sz);
-    if (!s->tap.data) { fclose(f); return -1; }
-
-    fread(s->tap.data, 1, (size_t)sz, f);
-    fclose(f);
-
-    s->tap.size = (uint32_t)sz;
-    s->tap.pos = 0;
+    if (tap_file_load(&s->tap, filename) != 0) return -1;
     s->tap.active = false;
-    s->tap.state = TAP_STATE_IDLE;
-    s->tap.ear = 0;
     s->tape_src = TAPE_TAP;
     s->mic_bit = 0;
-
-    printf("[TAP] Fichero cargado: %s (%ld bytes)\n", filename, sz);
     return 0;
-}
-
-static bool tap_next_block(TAPPlayer* t) {
-    if (!t->data || t->pos + 2 > t->size) {
-        t->state = TAP_STATE_IDLE;
-        t->active = false;
-        printf("[TAP] Fin de cinta.\n");
-        return false;
-    }
-
-    t->block_len = (uint32_t)t->data[t->pos] | ((uint32_t)t->data[t->pos + 1] << 8);
-    t->pos += 2;
-
-    if (t->pos + t->block_len > t->size) {
-        t->state = TAP_STATE_IDLE;
-        t->active = false;
-        printf("[TAP] Bloque truncado.\n");
-        return false;
-    }
-
-    t->byte_pos = 0;
-    t->bit_mask = 0x80;
-
-    uint8_t flag = t->data[t->pos];
-    t->pilot_count = (flag == 0x00) ? TAP_PILOT_HEADER : TAP_PILOT_DATA;
-    t->state = TAP_STATE_PILOT;
-    t->pulse_cycles = TAP_PILOT_PULSE;
-    t->ear = 1;
-
-    printf("[TAP] Bloque %u bytes, tipo %s\n", t->block_len,
-           (flag == 0x00) ? "cabecera" : "datos");
-    return true;
-}
-
-static void tap_update(TAPPlayer* t, int cycles) {
-    if (!t->active || t->state == TAP_STATE_IDLE) return;
-
-    t->pulse_cycles -= cycles;
-    while (t->pulse_cycles <= 0) {
-        t->ear ^= 1;
-
-        switch (t->state) {
-            case TAP_STATE_PILOT:
-                t->pilot_count--;
-                if (t->pilot_count <= 0) {
-                    t->state = TAP_STATE_SYNC1;
-                    t->pulse_cycles += TAP_SYNC1_PULSE;
-                } else {
-                    t->pulse_cycles += TAP_PILOT_PULSE;
-                }
-                break;
-
-            case TAP_STATE_SYNC1:
-                t->state = TAP_STATE_SYNC2;
-                t->pulse_cycles += TAP_SYNC2_PULSE;
-                break;
-
-            case TAP_STATE_SYNC2:
-                t->state = TAP_STATE_DATA;
-                t->byte_pos = 0;
-                t->bit_mask = 0x80;
-                t->pulse_cycles += (t->data[t->pos + t->byte_pos] & t->bit_mask) ?
-                                    TAP_BIT1_PULSE : TAP_BIT0_PULSE;
-                break;
-
-            case TAP_STATE_DATA: {
-                uint8_t cur_byte = t->data[t->pos + t->byte_pos];
-                int pw = (cur_byte & t->bit_mask) ? TAP_BIT1_PULSE : TAP_BIT0_PULSE;
-
-                if (t->ear == 0) {
-                    t->bit_mask >>= 1;
-                    if (t->bit_mask == 0) {
-                        t->bit_mask = 0x80;
-                        t->byte_pos++;
-                        if (t->byte_pos >= t->block_len) {
-                            t->pos += t->block_len;
-                            t->state = TAP_STATE_PAUSE;
-                            t->pulse_cycles += TAP_PAUSE_CYCLES;
-                            break;
-                        }
-                        cur_byte = t->data[t->pos + t->byte_pos];
-                    }
-                    pw = (cur_byte & t->bit_mask) ? TAP_BIT1_PULSE : TAP_BIT0_PULSE;
-                }
-
-                t->pulse_cycles += pw;
-                break;
-            }
-
-            case TAP_STATE_PAUSE:
-                t->ear = 0;
-                if (!tap_next_block(t)) return;
-                break;
-
-            default:
-                return;
-        }
-    }
-}
-
-static void tap_start(TAPPlayer* t) {
-    if (!t->data || t->size == 0) return;
-    t->pos = 0;
-    t->active = true;
-    printf("[TAP] Reproducción iniciada.\n");
-    tap_next_block(t);
 }
 
 // -----------------------------------------------------------------------------
@@ -677,7 +707,7 @@ int spectrum_load_tzx(ZXSpectrum* s, const char* filename) {
 
 void spectrum_tape_start(ZXSpectrum* s) {
     switch (s->tape_src) {
-        case TAPE_TAP: tap_start(&s->tap); break;
+        case TAPE_TAP: tap_file_start(&s->tap); break;
         case TAPE_TZX: tzx_start(&s->tzx); break;
         default: printf("[TAPE] No hay cinta cargada.\n"); break;
     }
@@ -727,7 +757,7 @@ static void spectrum_set_model_defaults(ZXSpectrum* s, ZXModel model) {
     spectrum_update_memory_map(s);
     ula_setup_clash(s);
 
-    ay8910_reset(&s->ay, ZX_CPU_CLOCK_HZ, AY_CLOCK_HZ);
+    ay_reset(&s->ay);
     fdc_init(&s->fdc);
     beta128_init(&s->beta);
 }
@@ -785,8 +815,7 @@ void spectrum_init(ZXSpectrum* s, ZXModel model) {
 }
 
 void spectrum_destroy(ZXSpectrum* s) {
-    free(s->tap.data);
-    s->tap.data = NULL;
+    tap_file_free(&s->tap);
     tzx_free(&s->tzx);
 
     SDL_DestroyTexture(s->texture);
@@ -1157,7 +1186,7 @@ void spectrum_run_frame(ZXSpectrum* s) {
         // Tape
         switch (s->tape_src) {
             case TAPE_TAP:
-                tap_update(&s->tap, total);
+                tap_file_update(&s->tap, total);
                 s->mic_bit = s->tap.ear;
                 break;
             case TAPE_TZX:
@@ -1188,9 +1217,9 @@ void spectrum_run_frame(ZXSpectrum* s) {
                 prev_sample_at = next_sample_at;
 
                 if (s->model != ZX_MODEL_48K)
-                    ay8910_step_tstates(&s->ay, (uint32_t)delta_t);
+                    ay_step_tstates(&s->ay, (uint32_t)delta_t);
 
-                float ay_out = (s->model != ZX_MODEL_48K) ? ay8910_mix(&s->ay) : 0.0f;
+                float ay_out = (s->model != ZX_MODEL_48K) ? ay_mix(&s->ay) : 0.0f;
 
                 float level = 0.0f;
                 if (s->ear_bit) level += 0.12f;

@@ -8,24 +8,12 @@
 #include "z80/jgz80/z80.h"
 #include "tzx.h"
 
+#include "tap_file.h"
 // FDC (uPD765) reutilizado del core CPC
 #include "cpc_fdc.h"
 
 // Beta 128 Disk Interface (WD1793) para Pentagon/Scorpion
 #include "beta128.h"
-
-#include "ay8910.h"
-// ---------------------------------------------------------------------------
-// Temporización TAP (T-states a ~3.5 MHz)
-// ---------------------------------------------------------------------------
-#define TAP_PILOT_PULSE 2168
-#define TAP_PILOT_HEADER 8063
-#define TAP_PILOT_DATA 3223
-#define TAP_SYNC1_PULSE 667
-#define TAP_SYNC2_PULSE 735
-#define TAP_BIT0_PULSE 855
-#define TAP_BIT1_PULSE 1710
-#define TAP_PAUSE_CYCLES 3500000
 
 // ---------------------------------------------------------------------------
 // Geometría de pantalla (común 48/128/+3)
@@ -56,35 +44,6 @@
 #define AY_CLOCK_HZ 1773400 // ~3.5469MHz/2
 
 // ---------------------------------------------------------------------------
-// Máquina de estados TAP
-// ---------------------------------------------------------------------------
-typedef enum {
-    TAP_STATE_IDLE = 0,
-    TAP_STATE_PILOT,
-    TAP_STATE_SYNC1,
-    TAP_STATE_SYNC2,
-    TAP_STATE_DATA,
-    TAP_STATE_PAUSE
-} TAPState;
-
-typedef struct {
-    uint8_t* data;
-    uint32_t size;
-    uint32_t pos;
-
-    uint32_t block_len;
-    uint32_t byte_pos;
-    uint8_t bit_mask;
-
-    TAPState state;
-    int pilot_count;
-    int32_t pulse_cycles;
-
-    uint8_t ear;
-    bool active;
-} TAPPlayer;
-
-// ---------------------------------------------------------------------------
 // Selector de fuente de cinta activa
 // ---------------------------------------------------------------------------
 typedef enum {
@@ -104,6 +63,46 @@ typedef enum {
     ZX_MODEL_PENTA1024,
     ZX_MODEL_SCORPION
 } ZXModel;
+
+// ---------------------------------------------------------------------------
+// AY-3-8912 (mínimo, suficiente para Spectrum 128/+3)
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint8_t regs[16];
+    uint8_t sel;
+
+    // Divisores internos
+    uint16_t div16;   // acumula ticks para /16
+    uint16_t div256;  // acumula ticks para /256
+
+    // Tonos
+    uint16_t tone_period[3];
+    uint16_t tone_count[3];
+    uint8_t  tone_out[3];
+
+    // Ruido
+    uint8_t  noise_period;
+    uint16_t noise_count;
+    uint32_t lfsr;
+    uint8_t  noise_out;
+
+    // Envolvente
+    uint16_t env_period;
+    uint16_t env_count;
+    uint8_t  env_shape;
+    int8_t   env_step;
+    uint8_t  env_vol;
+    uint8_t  env_hold;
+    uint8_t  env_alt;
+    uint8_t  env_attack;
+    uint8_t  env_continue;
+
+    // Acumulador de reloj AY (para conversión desde T-states)
+    uint32_t tick_accum; // en unidades de ZX_CPU_CLOCK_HZ
+
+    // Nivel último (para mezclar)
+    float last_sample;
+} AYState;
 
 // ---------------------------------------------------------------------------
 // Estructura principal del emulador
@@ -224,7 +223,7 @@ typedef struct {
     int audio_pos;
 
     // AY (128K/+3)
-    AY8910 ay;
+    AYState ay;
 
     // FDC (+3)
     FDC fdc;
