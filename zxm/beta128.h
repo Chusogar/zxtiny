@@ -119,11 +119,14 @@ typedef struct {
     uint8_t   system_reg;   // bits: D0-D1=drive, D2=reset(?), D3=head,
                             //       D4=HLT, D6=MFM, D7=intrq
 
-    // Estado interno
+    // Estado interno (based on ESPectrum wd1793)
     WD_CmdType  cmd_type;
     bool        busy;
     bool        drq;        // Data Request
-    bool        intrq;      // Interrupt Request
+    bool        intrq;      // Interrupt Request (normal)
+    bool        fintrq;     // Forced Interrupt Request (ESPectrum kRVMWD177XFINTRQ)
+    bool        status_type1; // true = last status is Type I format (Index/Track0/HeadLoaded)
+    bool        head_loaded;  // head load state (ESPectrum kRVMWD177XHLD)
 
     // Transferencia de datos
     int         data_pos;
@@ -131,9 +134,16 @@ typedef struct {
     uint8_t*    data_ptr;   // puntero al sector actual en el disco
     bool        data_write; // true si estamos escribiendo
     bool        multi_sector; // flag 'm' del comando
+    int         drq_timer;  // T-states since DRQ was asserted (for lost data)
+    int         cmd_delay;  // T-states remaining before DRQ assert (rotational delay)
+    uint8_t     id_buf[6];  // buffer for READ ADDRESS data
+    uint8_t     fmt_buf[BETA_TRACK_SIZE]; // scratch buffer for WRITE TRACK
 
     // Dirección de step (para STEP sin dirección)
     int         step_dir;   // +1 o -1
+
+    // Disk rotation simulation for READ ADDRESS
+    int         rot_sector; // rotating sector counter (1-16)
 
     // Drive/side seleccionados
     uint8_t     sel_drive;
@@ -142,8 +152,9 @@ typedef struct {
     // Paginación Beta ROM
     bool        beta_active; // ROM Beta paginada en 0x0000-0x3FFF
 
-    // Contador de index pulse
+    // Contador de index pulse (simula rotación del disco)
     int         index_counter;
+    bool        index_pulse;  // pulso de índice activo
 
 } Beta128;
 
@@ -168,6 +179,9 @@ bool beta128_load_scl(Beta128* beta, int drive, const char* path);
 
 // Expulsa el disco de la unidad
 void beta128_eject(Beta128* beta, int drive);
+
+// Insert empty formatted TRD disk (like ESPectrum default)
+bool beta128_insert_empty(Beta128* beta, int drive);
 
 // Retorna true si hay un INTRQ pendiente
 bool beta128_intrq(Beta128* beta);

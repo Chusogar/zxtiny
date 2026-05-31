@@ -55,6 +55,7 @@ void beta128_init(Beta128* beta) {
 }
 
 void beta128_reset(Beta128* beta) {
+    // Based on ESPectrum rvmWD1793Reset()
     beta->status = 0;
     beta->track_reg = 0;
     beta->sector_reg = 1;
@@ -65,6 +66,9 @@ void beta128_reset(Beta128* beta) {
     beta->busy = false;
     beta->drq = false;
     beta->intrq = false;
+    beta->fintrq = false;
+    beta->status_type1 = true;  // Power-on status is Type I
+    beta->head_loaded = false;
     beta->data_pos = 0;
     beta->data_len = 0;
     beta->data_ptr = NULL;
@@ -74,6 +78,7 @@ void beta128_reset(Beta128* beta) {
     beta->sel_drive = 0;
     beta->sel_side = 0;
     beta->index_counter = 0;
+    beta->index_pulse = true;  // Disk is already spinning on power-up
     // No resetear discos montados
 }
 
@@ -81,12 +86,18 @@ void beta128_reset(Beta128* beta) {
 // Ejecución de comandos WD1793
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Based on ESPectrum _end()
 static void finish_command(Beta128* beta, uint8_t status_bits) {
     beta->busy = false;
     beta->drq = false;
     beta->intrq = true;
     beta->status = status_bits;
     beta->cmd_type = WD_CMD_NONE;
+    // status_type1 stays as the command set it (Type I commands set it to
+    // true; Type II/III set it to false).  This is important because
+    // TRACK0 (bit 2 in Type I) shares the same bit as LOST_DATA (bit 2 in
+    // Type II/III) — forcing Type I after READ SECTOR at track 0 would
+    // cause TR-DOS to misinterpret TRACK0 as a disk error.
 
     BetaDrive* drv = cur_drive(beta);
     if (!drv->disk.inserted) {
@@ -94,20 +105,33 @@ static void finish_command(Beta128* beta, uint8_t status_bits) {
     }
 }
 
+// Type I commands — based on ESPectrum state machine.
+// ESPectrum sets kRVMWD177XStatusSetHead at TypeIEnd, then _end() sets INTRQ.
+// Status bits Track0 and WP are resolved dynamically at read time.
+//
+// Type I commands use cmd_delay to simulate seek/step time.  This is
+// critical for Scorpion: TR-DOS's ISR (at $FFEF) corrupts register A.
+// If RESTORE completes instantly, the ISR fires at a point where the
+// corruption causes a wrong code path and premature exit.  With a
+// realistic delay, the ISR fires during the busy-wait polling loop
+// where A is immediately reloaded by IN A,($1F), so corruption is
+// harmless.
+//
+// Step rate per ESPectrum: srate[5][0]=46 steps, WD177XSTEPSTATES=112
+// → ~5152 T-states per track step at fastest rate.
+
+#define WD_STEP_TSTATES 5152  // T-states per track step (fastest rate)
+
 static void exec_restore(Beta128* beta) {
     BetaDrive* drv = cur_drive(beta);
+    int steps = drv->current_track > 0 ? drv->current_track : 1;
     drv->current_track = 0;
     beta->track_reg = 0;
-    beta->busy = false;
-    beta->intrq = true;
-
-    uint8_t st = WD_ST_TRACK0;
-    if (drv->disk.inserted) {
-        st |= WD_ST_HEADLOADED;
-    } else {
-        st |= WD_ST_NOTREADY;
-    }
-    beta->status = st;
+    beta->status_type1 = true;
+    beta->busy = true;
+    beta->status = WD_ST_BUSY;
+    beta->cmd_delay = steps * WD_STEP_TSTATES;
+    beta->drq = false;
 }
 
 static void exec_seek(Beta128* beta) {
@@ -119,15 +143,15 @@ static void exec_seek(Beta128* beta) {
     if (target > drv->current_track) beta->step_dir = 1;
     else if (target < drv->current_track) beta->step_dir = -1;
 
+    int steps = abs(target - drv->current_track);
+    if (steps < 1) steps = 1;
     drv->current_track = target;
     beta->track_reg = (uint8_t)target;
-    beta->busy = false;
-    beta->intrq = true;
-
-    uint8_t st = WD_ST_HEADLOADED;
-    if (drv->current_track == 0) st |= WD_ST_TRACK0;
-    if (!drv->disk.inserted) st |= WD_ST_NOTREADY;
-    beta->status = st;
+    beta->status_type1 = true;
+    beta->busy = true;
+    beta->status = WD_ST_BUSY;
+    beta->cmd_delay = steps * WD_STEP_TSTATES;
+    beta->drq = false;
 }
 
 static void exec_step(Beta128* beta, int direction) {
@@ -140,25 +164,22 @@ static void exec_step(Beta128* beta, int direction) {
 
     drv->current_track = new_track;
 
-    // Update track register si flag 'T' (bit 4) está activo
     if (beta->command_reg & 0x10) {
         beta->track_reg = (uint8_t)new_track;
     }
 
-    beta->busy = false;
-    beta->intrq = true;
-
-    uint8_t st = WD_ST_HEADLOADED;
-    if (drv->current_track == 0) st |= WD_ST_TRACK0;
-    if (!drv->disk.inserted) st |= WD_ST_NOTREADY;
-    beta->status = st;
+    beta->status_type1 = true;
+    beta->busy = true;
+    beta->status = WD_ST_BUSY;
+    beta->cmd_delay = WD_STEP_TSTATES;
+    beta->drq = false;
 }
 
 static void exec_read_sector(Beta128* beta) {
     BetaDrive* drv = cur_drive(beta);
 
     if (!drv->disk.inserted) {
-        finish_command(beta, WD_ST_NOTREADY);
+        finish_command(beta, WD_ST_RNFERR);
         return;
     }
 
@@ -174,15 +195,16 @@ static void exec_read_sector(Beta128* beta) {
     beta->data_len = BETA_SECTOR_SIZE;
     beta->data_write = false;
     beta->drq = true;
+    beta->drq_timer = 0;
     beta->busy = true;
-    beta->status = WD_ST_BUSY | WD_ST_DRQ;
+    beta->status = WD_ST_BUSY;  // DRQ resolved dynamically on status read
 }
 
 static void exec_write_sector(Beta128* beta) {
     BetaDrive* drv = cur_drive(beta);
 
     if (!drv->disk.inserted) {
-        finish_command(beta, WD_ST_NOTREADY);
+        finish_command(beta, WD_ST_RNFERR);
         return;
     }
 
@@ -204,66 +226,102 @@ static void exec_write_sector(Beta128* beta) {
     beta->data_write = true;
     beta->drq = true;
     beta->busy = true;
-    beta->status = WD_ST_BUSY | WD_ST_DRQ;
+    beta->status = WD_ST_BUSY;  // DRQ resolved dynamically on status read
 }
 
 static void exec_read_address(Beta128* beta) {
     BetaDrive* drv = cur_drive(beta);
 
     if (!drv->disk.inserted) {
-        finish_command(beta, WD_ST_NOTREADY);
+        finish_command(beta, WD_ST_RNFERR);
         return;
     }
 
-    // Devuelve 6 bytes: track, side, sector, sector_size, crc1, crc2
-    // Usamos un buffer estático en data_reg area
-    static uint8_t id_buf[6];
-    id_buf[0] = (uint8_t)drv->current_track;
-    id_buf[1] = beta->sel_side;
-    id_buf[2] = beta->sector_reg;
-    id_buf[3] = 0x01; // size code 1 = 256 bytes
-    id_buf[4] = 0x00; // CRC placeholder
-    id_buf[5] = 0x00;
+    // Simulate disk rotation: return incrementing sector IDs (1-16)
+    beta->rot_sector++;
+    if (beta->rot_sector > BETA_SECTORS_PER_TRACK)
+        beta->rot_sector = 1;
 
-    beta->data_ptr = id_buf;
+    // Prepare 6 bytes: track, side, sector, sector_size, crc1, crc2
+    beta->id_buf[0] = (uint8_t)drv->current_track;
+    beta->id_buf[1] = beta->sel_side;
+    beta->id_buf[2] = (uint8_t)beta->rot_sector;
+    beta->id_buf[3] = 0x01; // size code 1 = 256 bytes
+    beta->id_buf[4] = 0x00; // CRC placeholder
+    beta->id_buf[5] = 0x00;
+
+    // Also update sector_reg (ESPectrum behavior)
+    beta->sector_reg = (uint8_t)beta->rot_sector;
+
+    // Assert DRQ immediately — matches YASE/ESPectrum instant completion
+    // model. The host reads 6 bytes via the data register; DRQ is
+    // reasserted after each byte read.
+    beta->data_ptr = beta->id_buf;
     beta->data_pos = 0;
     beta->data_len = 6;
     beta->data_write = false;
     beta->drq = true;
+    beta->drq_timer = 0;
+    beta->cmd_delay = 0;
     beta->busy = true;
-    beta->status = WD_ST_BUSY | WD_ST_DRQ;
+    beta->status = WD_ST_BUSY;
 }
 
+// Based on ESPectrum rvmWD1793Write() command handling
 static void exec_command(Beta128* beta, uint8_t cmd) {
     beta->command_reg = cmd;
-    beta->intrq = false;
 
-    // Type IV: Force Interrupt
+    // Type IV: Force Interrupt — based on ESPectrum
     if ((cmd & 0xF0) == 0xD0) {
         beta->cmd_type = WD_CMD_FORCE_INT;
-        beta->busy = false;
-        beta->drq = false;
-        beta->data_ptr = NULL;
-        beta->data_pos = 0;
-        beta->data_len = 0;
-        // Interrumpir comando en curso, generar INTRQ si bits 0-3 != 0
-        if (cmd & 0x0F) {
+
+        if (beta->busy) {
+            // Abort current command (ESPectrum: _end())
+            beta->busy = false;
+            beta->drq = false;
+            beta->cmd_delay = 0;
+            beta->data_ptr = NULL;
+            beta->data_pos = 0;
+            beta->data_len = 0;
+            // Reset to Type I status so HEAD_LOADED is visible
+            beta->status_type1 = true;
+            beta->status = 0;
+        } else {
+            // Not busy: set Type I status with dynamic flags
+            beta->status_type1 = true;
+            beta->status = 0;
+        }
+
+        // Lower nibble controls INTRQ (ESPectrum behavior)
+        if ((cmd & 0x0F) == 0x00) {
+            // $D0: clear both INTRQ sources
+            beta->intrq = false;
+            beta->fintrq = false;
+        } else if (cmd & 0x08) {
+            // Bit 3 set: immediate INTRQ
+            beta->fintrq = true;
+        } else {
             beta->intrq = true;
         }
-        // Reconstruir status como Type I
-        BetaDrive* drv = cur_drive(beta);
-        uint8_t st = 0;
-        if (drv->disk.inserted) st |= WD_ST_HEADLOADED;
-        else st |= WD_ST_NOTREADY;
-        if (drv->current_track == 0) st |= WD_ST_TRACK0;
-        beta->status = st;
         return;
     }
 
+    // Don't accept new commands while busy (ESPectrum check)
+    if (beta->busy) return;
+
+    // Clear INTRQ on new command (ESPectrum behavior)
+    beta->intrq = false;
+    beta->fintrq = false;
+
+    // Check if drive has disk (ESPectrum: check disk exists and power)
+    BetaDrive* drv = cur_drive(beta);
+
     // Type I: RESTORE, SEEK, STEP, STEP-IN, STEP-OUT
     if ((cmd & 0x80) == 0x00) {
+
         beta->busy = true;
         beta->status = WD_ST_BUSY;
+        beta->status_type1 = true;
 
         if ((cmd & 0xF0) == 0x00) {
             beta->cmd_type = WD_CMD_RESTORE;
@@ -286,6 +344,8 @@ static void exec_command(Beta128* beta, uint8_t cmd) {
 
     // Type II: READ SECTOR, WRITE SECTOR
     if ((cmd & 0xC0) == 0x80) {
+
+        beta->status_type1 = false;
         beta->multi_sector = (cmd & 0x10) ? true : false;
 
         if ((cmd & 0xE0) == 0x80) {
@@ -300,17 +360,18 @@ static void exec_command(Beta128* beta, uint8_t cmd) {
 
     // Type III: READ ADDRESS, READ TRACK, WRITE TRACK
     if ((cmd & 0xF0) == 0xC0) {
+        beta->status_type1 = false;
         beta->cmd_type = WD_CMD_READ_ADDR;
         exec_read_address(beta);
         return;
     }
 
     if ((cmd & 0xF0) == 0xE0) {
+        beta->status_type1 = false;
         // READ TRACK - simplified: treat as reading the whole track
         beta->cmd_type = WD_CMD_READ_TRACK;
-        BetaDrive* drv = cur_drive(beta);
         if (!drv->disk.inserted) {
-            finish_command(beta, WD_ST_NOTREADY);
+            finish_command(beta, WD_ST_RNFERR);
             return;
         }
         // Point to the beginning of the track
@@ -322,7 +383,7 @@ static void exec_command(Beta128* beta, uint8_t cmd) {
             beta->data_write = false;
             beta->drq = true;
             beta->busy = true;
-            beta->status = WD_ST_BUSY | WD_ST_DRQ;
+            beta->status = WD_ST_BUSY;
         } else {
             finish_command(beta, WD_ST_RNFERR);
         }
@@ -330,29 +391,18 @@ static void exec_command(Beta128* beta, uint8_t cmd) {
     }
 
     if ((cmd & 0xF0) == 0xF0) {
-        // WRITE TRACK (format) - simplified
+        beta->status_type1 = false;
+        // WRITE TRACK (format) — complete immediately (disk pre-formatted)
         beta->cmd_type = WD_CMD_WRITE_TRACK;
-        BetaDrive* drv = cur_drive(beta);
         if (!drv->disk.inserted) {
-            finish_command(beta, WD_ST_NOTREADY);
+            finish_command(beta, WD_ST_RNFERR);
             return;
         }
         if (drv->disk.write_protected) {
             finish_command(beta, WD_ST_WRPROTECT);
             return;
         }
-        int off = disk_offset(drv->current_track, beta->sel_side, 1);
-        if (off >= 0 && (size_t)(off + BETA_TRACK_SIZE) <= drv->disk.data_size) {
-            beta->data_ptr = &drv->disk.data[off];
-            beta->data_pos = 0;
-            beta->data_len = BETA_TRACK_SIZE;
-            beta->data_write = true;
-            beta->drq = true;
-            beta->busy = true;
-            beta->status = WD_ST_BUSY | WD_ST_DRQ;
-        } else {
-            finish_command(beta, WD_ST_RNFERR);
-        }
+        finish_command(beta, 0);
         return;
     }
 }
@@ -361,12 +411,39 @@ static void exec_command(Beta128* beta, uint8_t cmd) {
 // Lectura / Escritura de puertos
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Based on ESPectrum rvmWD1793Read()
 uint8_t beta128_read(Beta128* beta, uint16_t port) {
     switch (port & 0xFF) {
         case 0x1F: {
-            // Status Register
-            uint8_t st = beta->status;
-            beta->intrq = false;
+            // Status Register — based on ESPectrum dynamic flag resolution
+            beta->intrq = false;  // Reading status clears INTRQ
+            beta->fintrq = false; // Also clear forced INTRQ
+
+            uint8_t st = beta->status & 0xFF;
+            BetaDrive* drv = cur_drive(beta);
+
+            if (beta->status_type1) {
+                // Type I status: dynamically resolve Track0, WP, Index, HeadLoaded
+                if (drv->disk.write_protected)
+                    st |= WD_ST_WRPROTECT;
+
+                if (drv->current_track == 0)
+                    st |= WD_ST_TRACK0;
+
+                // Index pulse: simulated rotation (ESPectrum: kRVMwdDiskOutIndex)
+                if (beta->index_pulse)
+                    st |= WD_ST_INDEX;
+
+                // Head loaded (ESPectrum: kRVMWD177XStatusSetHead)
+                if (beta->head_loaded)
+                    st |= WD_ST_HEADLOADED;
+            } else {
+                // Type II/III status: DRQ is in bit 1
+                if (beta->drq)
+                    st |= WD_ST_DRQ;
+                // NOTREADY only if no disk (already handled above)
+            }
+
             return st;
         }
 
@@ -377,13 +454,14 @@ uint8_t beta128_read(Beta128* beta, uint16_t port) {
             return beta->sector_reg;
 
         case 0x7F: {
-            // Data Register
-            if (beta->drq && beta->data_ptr && !beta->data_write) {
+            // Data Register — based on ESPectrum: clear DRQ on read
+            beta->drq = false;
+
+            if (beta->data_ptr && !beta->data_write) {
                 if (beta->data_pos < beta->data_len) {
                     beta->data_reg = beta->data_ptr[beta->data_pos++];
 
                     if (beta->data_pos >= beta->data_len) {
-                        // Sector/data transfer completo
                         if (beta->multi_sector && beta->cmd_type == WD_CMD_READ_SEC) {
                             beta->sector_reg++;
                             if (beta->sector_reg <= BETA_SECTORS_PER_TRACK) {
@@ -394,6 +472,10 @@ uint8_t beta128_read(Beta128* beta, uint16_t port) {
                         } else {
                             finish_command(beta, 0);
                         }
+                    } else {
+                        // More bytes to transfer: re-assert DRQ
+                        beta->drq = true;
+                        beta->drq_timer = 0;
                     }
                 }
             }
@@ -401,10 +483,10 @@ uint8_t beta128_read(Beta128* beta, uint16_t port) {
         }
 
         case 0xFF: {
-            // System Register read
+            // System Register read — based on ESPectrum
             uint8_t val = 0;
-            // Bit 7: INTRQ
-            if (beta->intrq) val |= 0x80;
+            // Bit 7: INTRQ (either normal or forced)
+            if (beta->intrq || beta->fintrq) val |= 0x80;
             // Bit 6: DRQ
             if (beta->drq) val |= 0x40;
             return val;
@@ -431,10 +513,11 @@ void beta128_write(Beta128* beta, uint16_t port, uint8_t val) {
             break;
 
         case 0x7F: {
-            // Data Register
+            // Data Register — based on ESPectrum: clear DRQ on write
             beta->data_reg = val;
+            beta->drq = false;
 
-            if (beta->drq && beta->data_ptr && beta->data_write) {
+            if (beta->data_ptr && beta->data_write) {
                 if (beta->data_pos < beta->data_len) {
                     beta->data_ptr[beta->data_pos++] = val;
 
@@ -449,6 +532,10 @@ void beta128_write(Beta128* beta, uint16_t port, uint8_t val) {
                         } else {
                             finish_command(beta, 0);
                         }
+                    } else {
+                        // More bytes to accept: re-assert DRQ
+                        beta->drq = true;
+                        beta->drq_timer = 0;
                     }
                 }
             }
@@ -707,6 +794,41 @@ bool beta128_load_scl(Beta128* beta, int drive, const char* path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Create empty formatted TRD disk (like ESPectrum default)
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool beta128_insert_empty(Beta128* beta, int drive) {
+    if (drive < 0 || drive >= BETA_MAX_DRIVES) return false;
+    BetaDrive* drv = &beta->drives[drive];
+
+    if (drv->disk.data) {
+        free(drv->disk.data);
+        drv->disk.data = NULL;
+    }
+
+    drv->disk.data = (uint8_t*)calloc(1, BETA_DISK_SIZE);
+    if (!drv->disk.data) return false;
+    drv->disk.data_size = BETA_DISK_SIZE;
+    drv->disk.inserted = true;
+    drv->disk.write_protected = false;
+    drv->disk.num_tracks = 80;
+    drv->disk.num_sides = 2;
+
+    // Disk info sector (track 0, side 0, sector 9 → offset 0x800)
+    drv->disk.data[0x8E1] = 0x00;  // first free sector (0-based)
+    drv->disk.data[0x8E2] = 0x01;  // first free logical track (track 0 side 1)
+    drv->disk.data[0x8E3] = 0x16;  // 80 tracks, double-sided
+    drv->disk.data[0x8E4] = 0x00;  // 0 files
+    // Free sectors: 2560 - 16 = 2544 = 0x09F0
+    drv->disk.data[0x8E5] = 0xF0;  // free sectors low
+    drv->disk.data[0x8E6] = 0x09;  // free sectors high
+    drv->disk.data[0x8E7] = 0x10;  // TR-DOS ID byte
+    memset(&drv->disk.data[0x8F5], ' ', 8);  // disk label
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Expulsión de disco
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -727,25 +849,64 @@ void beta128_eject(Beta128* beta, int drive) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool beta128_intrq(Beta128* beta) {
-    return beta->intrq;
+    return beta->intrq || beta->fintrq;
 }
 
+// Based on ESPectrum rvmWD1793Step() — simplified for instant-completion model
 void beta128_tick(Beta128* beta, int delta) {
-    (void)delta;
-    // Simular index pulse: cada ~200ms (aprox 10 revoluciones/segundo)
-    // El index pulse dura muy poco, aquí simplemente lo mantenemos
-    // disponible cuando se lee el status y no hay comando activo.
+    // Index pulse simulation: 300 RPM = 200ms per revolution = ~70000 T-states at 3.5MHz
+    // Index pulse duration: ~4ms = ~14000 T-states
     beta->index_counter += delta;
-    if (beta->index_counter >= 70000) { // ~1 revolución
+    if (beta->index_counter >= 70000) {
         beta->index_counter = 0;
-        // Index pulse visible en status solo durante Type I idle
-        if (!beta->busy) {
-            beta->status |= WD_ST_INDEX;
+        beta->index_pulse = true;
+    } else if (beta->index_counter >= 14000) {
+        beta->index_pulse = false;
+    }
+
+    // Command delay: count down before completing Type I commands or
+    // asserting DRQ for READ ADDRESS.
+    if (beta->cmd_delay > 0 && beta->busy) {
+        beta->cmd_delay -= delta;
+        if (beta->cmd_delay <= 0) {
+            beta->cmd_delay = 0;
+            if (beta->cmd_type >= WD_CMD_RESTORE && beta->cmd_type <= WD_CMD_STEP_OUT) {
+                // Type I command completed — set head loaded and INTRQ
+                beta->head_loaded = true;
+                beta->busy = false;
+                beta->intrq = true;
+                beta->status = 0;  // Track0, WP, NOTREADY resolved dynamically
+            } else {
+                // Type II/III (READ ADDRESS): assert DRQ
+                beta->drq = true;
+                beta->drq_timer = 0;
+            }
         }
-    } else if (beta->index_counter >= 1000) {
-        // Quitar index pulse después de un breve período
-        if (!beta->busy) {
-            beta->status &= ~WD_ST_INDEX;
+    }
+
+    // Lost data: if DRQ is asserted but host hasn't read/written,
+    // auto-advance after timeout. READ_ADDR uses longer timeout (whole sector
+    // pass time) since TR-DOS polling loops need DRQ to stay high longer.
+    if (beta->drq && beta->busy) {
+        beta->drq_timer += delta;
+        int timeout = (beta->cmd_type == WD_CMD_READ_ADDR) ? 40000 : 192;
+        if (beta->drq_timer >= timeout) {
+            beta->drq_timer = 0;
+            // Auto-advance: skip this byte (lost data)
+            if (beta->data_ptr && beta->data_pos < beta->data_len) {
+                beta->data_pos++;
+                if (beta->data_pos >= beta->data_len) {
+                    // Transfer complete (with lost data)
+                    finish_command(beta, WD_ST_LOSTDATA);
+                } else {
+                    // More bytes — DRQ stays asserted, timer resets
+                }
+            } else {
+                // No data buffer — finish immediately
+                finish_command(beta, WD_ST_LOSTDATA);
+            }
         }
+    } else {
+        beta->drq_timer = 0;
     }
 }

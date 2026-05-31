@@ -290,11 +290,8 @@ static inline void spectrum_apply_7ffd_force(ZXSpectrum* s, uint8_t val) {
 
 static inline void spectrum_write_7ffd(ZXSpectrum* s, uint8_t val) {
     if (s->model == ZX_MODEL_48K) return;
+    // Scorpion: paging_lock does NOT block 7FFD (hardware ignores bit 5)
     if (s->paging_lock && s->model != ZX_MODEL_SCORPION) return;
-    if (s->paging_lock && s->model == ZX_MODEL_SCORPION) {
-        // Scorpion: paging_lock bloquea 7FFD pero no 1FFD
-        return;
-    }
     spectrum_apply_7ffd_force(s, val);
 }
 
@@ -549,7 +546,7 @@ static uint8_t port_in(z80* z, uint16_t port) {
         if (is_3ffd(port)) return fdc_read_data(&s->fdc);
     }
 
-    // Scorpion: lectura de puerto $BF pagina la ROM TR-DOS (matching YASE)
+    // Scorpion: lectura de puerto $BF pagina la ROM TR-DOS
     if (s->model == ZX_MODEL_SCORPION && (port & 0xFF) == 0xBF && !s->beta_active) {
         s->beta_active = true;
         spectrum_update_memory_map(s);
@@ -557,8 +554,10 @@ static uint8_t port_in(z80* z, uint16_t port) {
     }
 
     // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
+    // Scorpion: FDC accessible also when service ROM is paged (port_1ffd bit 1)
     if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
-        s->beta_active && is_beta_port(port)) {
+        is_beta_port(port) &&
+        (s->beta_active || (s->model == ZX_MODEL_SCORPION && (s->port_1ffd & 0x02)))) {
         return beta128_read(&s->beta, port);
     }
 
@@ -571,6 +570,8 @@ static uint8_t port_in(z80* z, uint16_t port) {
 
 static void port_out(z80* z, uint16_t port, uint8_t val) {
     ZXSpectrum* s = (ZXSpectrum*)z->userdata;
+
+    // DEBUG: log port writes that are NOT the 7FFD toggle at 0x5B10
 
     if (!(port & 1) || addr_contended(s, port)) {
         int pos = s->ula_clash_z % s->ula_ticks_per_frame;
@@ -617,8 +618,10 @@ static void port_out(z80* z, uint16_t port, uint8_t val) {
     }
 
     // Beta 128 (Pentagon/Scorpion): puertos 0x1F..0xFF
+    // Scorpion: FDC accessible also when service ROM is paged (port_1ffd bit 1)
     if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
-        s->beta_active && is_beta_port(port)) {
+        is_beta_port(port) &&
+        (s->beta_active || (s->model == ZX_MODEL_SCORPION && (s->port_1ffd & 0x02)))) {
         beta128_write(&s->beta, port, val);
         return;
     }
@@ -1146,15 +1149,23 @@ void spectrum_handle_key(ZXSpectrum* s, SDL_Scancode key, bool pressed) {
         case SDL_SCANCODE_N:      row=7; bit=3; break;
         case SDL_SCANCODE_B:      row=7; bit=4; break;
 
-        // Kempston joystick
+        // Kempston joystick + ZX Spectrum cursor keys (CS+5/6/7/8)
         case SDL_SCANCODE_RIGHT:
-            if (pressed) s->kempston |= 0x01; else s->kempston &= ~0x01; return;
+            if (pressed) { s->kempston |= 0x01; s->keyboard_matrix[0] &= ~1; s->keyboard_matrix[4] &= ~(1<<2); }
+            else { s->kempston &= ~0x01; s->keyboard_matrix[0] |= 1; s->keyboard_matrix[4] |= (1<<2); }
+            return;
         case SDL_SCANCODE_LEFT:
-            if (pressed) s->kempston |= 0x02; else s->kempston &= ~0x02; return;
+            if (pressed) { s->kempston |= 0x02; s->keyboard_matrix[0] &= ~1; s->keyboard_matrix[3] &= ~(1<<4); }
+            else { s->kempston &= ~0x02; s->keyboard_matrix[0] |= 1; s->keyboard_matrix[3] |= (1<<4); }
+            return;
         case SDL_SCANCODE_DOWN:
-            if (pressed) s->kempston |= 0x04; else s->kempston &= ~0x04; return;
+            if (pressed) { s->kempston |= 0x04; s->keyboard_matrix[0] &= ~1; s->keyboard_matrix[4] &= ~(1<<4); }
+            else { s->kempston &= ~0x04; s->keyboard_matrix[0] |= 1; s->keyboard_matrix[4] |= (1<<4); }
+            return;
         case SDL_SCANCODE_UP:
-            if (pressed) s->kempston |= 0x08; else s->kempston &= ~0x08; return;
+            if (pressed) { s->kempston |= 0x08; s->keyboard_matrix[0] &= ~1; s->keyboard_matrix[4] &= ~(1<<3); }
+            else { s->kempston &= ~0x08; s->keyboard_matrix[0] |= 1; s->keyboard_matrix[4] |= (1<<3); }
+            return;
         case SDL_SCANCODE_RALT:
         case SDL_SCANCODE_RCTRL:
             if (pressed) s->kempston |= 0x10; else s->kempston &= ~0x10; return;
@@ -1217,23 +1228,65 @@ void spectrum_run_frame(ZXSpectrum* s) {
 
     z80_pulse_irq(&s->cpu, 0xFF);
 
+    // PC ring buffer for auto-paging jump detection
+    static uint16_t pc_ring[8];
+    static int pc_ring_idx = 0;
     while (cycles_done < TSTATES_PER_FRAME) {
-        // Beta 128 auto-paging (Pentagon/Scorpion) — matching YASE:
-        // Activación: PC en $3D00-$3DFF y ROM 1 (48K BASIC) paginada.
-        // Desactivación: PC >= $4000 y TR-DOS ROM activa.
-        // Port $BF (Scorpion): activación incondicional (en port_in).
+        // Record PC in ring buffer
+        pc_ring[pc_ring_idx & 7] = s->cpu.pc;
+        pc_ring_idx = (pc_ring_idx + 1) & 7;
+        // Beta 128 auto-paging (Pentagon/Scorpion) — matches YASE:
+        // Activation:  PC in $3D00-$3DFF AND ROM 1 (48K BASIC) at slot 0
+        // Deactivation: PC >= $4000 AND TR-DOS active
+        //
+        // No interrupt suppression: when an IM2 interrupt fires while
+        // TR-DOS is active, the ISR at $FFEF deactivates beta, runs a
+        // keyboard check from 48K BASIC ROM, then jumps to $3D30 to
+        // reactivate beta. This matches YASE behaviour exactly.
         if ((s->model == ZX_MODEL_PENTAGON || s->model == ZX_MODEL_SCORPION) &&
             s->have_rom_beta) {
             uint16_t pc = s->cpu.pc;
-            if (pc >= 0x4000 && s->beta_active) {
-                s->beta_active = false;
-                spectrum_update_memory_map(s);
-            } else if ((pc & 0xFF00) == 0x3D00 && !s->beta_active &&
-                       s->rom_page == 1) {
+            // Match YASE: activation only when actual ROM at slot 0
+            // is ROM 1 (48K BASIC). For Scorpion, 1FFD bits 0-1 can
+            // override the ROM to all-RAM or service ROM — don't
+            // activate beta in those cases.
+            bool rom_gate;
+            if (s->model == ZX_MODEL_SCORPION)
+                rom_gate = (s->rom_page == 1) && !(s->port_1ffd & 0x03);
+            else
+                rom_gate = (s->rom_page != 0);
+
+            if (s->beta_active) {
+                // Match YASE: deactivate whenever PC >= 0x4000 and
+                // TR-DOS ROM is currently mapped.  No interrupt
+                // suppression — the Scorpion ISR at $FFEF reactivates
+                // beta by jumping to $3D30 after its keyboard check.
+                if (pc >= 0x4000) {
+                    s->beta_active = false;
+                    spectrum_update_memory_map(s);
+
+                    // Reset WD1793 status to Type I so that the Scorpion
+                    // service ROM polling loop at $0237 can see HEAD_LOADED
+                    // (bit 5).  Without this, a Type II/III command left by
+                    // TR-DOS leaves status_type1=false, and HEAD_LOADED is
+                    // invisible → the polling loop hangs.
+                    if (s->model == ZX_MODEL_SCORPION) {
+                        s->beta.status_type1 = true;
+                        s->beta.status = 0;
+                    }
+                }
+            } else if (rom_gate && (pc & 0xFF00) == 0x3D00 &&
+                // Scorpion: only activate on a JUMP into this range, not
+                // sequential flow (prevents oscillation when scorp1.rom
+                // code flows through 0x3D00-0x3DFF during boot).
+                (s->model != ZX_MODEL_SCORPION ||
+                 (pc_ring[(pc_ring_idx - 2 + 8) & 7] & 0xFF00) != 0x3D00)
+                ) {
                 s->beta_active = true;
                 spectrum_update_memory_map(s);
             }
         }
+
 
         s->contention_extra = 0;
         int base_cycles = (int)z80_step(&s->cpu);
@@ -1438,6 +1491,9 @@ int main(int argc, char* argv[]) {
         if (spectrum_load_rom_beta(&spec, "trdos.rom") != 0)
             printf("Aviso: 'trdos.rom' no encontrada. Sin soporte TR-DOS.\n");
         beta128_reset(&spec.beta);
+        // Insert empty formatted disks (like ESPectrum)
+        for (int d = 0; d < BETA_MAX_DRIVES; d++)
+            beta128_insert_empty(&spec.beta, d);
         spectrum_apply_7ffd_force(&spec, 0x00);
     }
 
@@ -1475,6 +1531,9 @@ int main(int argc, char* argv[]) {
             printf("Aviso: 'scorp3.rom' no encontrada.\n");
         }
         beta128_reset(&spec.beta);
+        // Insert empty formatted disks (like ESPectrum)
+        for (int d = 0; d < BETA_MAX_DRIVES; d++)
+            beta128_insert_empty(&spec.beta, d);
         spectrum_apply_7ffd_force(&spec, 0x00);
         // Scorpion 1FFD init (sin lógica +3)
         spec.port_1ffd = 0x00;
