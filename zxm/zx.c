@@ -1335,15 +1335,28 @@ void spectrum_run_frame(ZXSpectrum* s) {
                 float ay_out = (s->model != ZX_MODEL_48K) ? ay_mix(&s->ay) : 0.0f;
 
                 float level = 0.0f;
-                if (s->ear_bit) level += 0.12f;
-                if (s->mic_bit) level += 0.12f;
+                if (s->ear_bit) level += 0.5f;
+                if (s->mic_bit) level += 0.3f;
+                level += ay_out;
 
-                level += (ay_out - 0.15f);
-                if (level == 0.0f) level = -0.05f;
-                if (level > 1.0f) level = 1.0f;
-                if (level < -1.0f) level = -1.0f;
+                // Low-pass filter (one-pole IIR, cutoff ~11 kHz at 44.1 kHz)
+                // Smooths square waves and reduces aliasing clicks
+                const float lpf_alpha = 0.6f;
+                s->audio_lpf += lpf_alpha * (level - s->audio_lpf);
+                level = s->audio_lpf;
 
-                s->audio_buffer[s->audio_pos++] = level;
+                // DC-blocking high-pass filter (removes DC offset)
+                // y[n] = x[n] - x[n-1] + 0.995 * y[n-1]
+                float filtered = level - s->audio_prev_in + 0.995f * s->audio_prev_out;
+                s->audio_prev_in = level;
+                s->audio_prev_out = filtered;
+
+                // Scale and clamp
+                filtered *= 0.45f;
+                if (filtered > 1.0f) filtered = 1.0f;
+                if (filtered < -1.0f) filtered = -1.0f;
+
+                s->audio_buffer[s->audio_pos++] = filtered;
             }
             next_sample_at += TSTATES_PER_SAMPLE;
         }

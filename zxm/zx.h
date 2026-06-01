@@ -238,6 +238,9 @@ typedef struct {
     SDL_AudioDeviceID audio_dev;
     float audio_buffer[AUDIO_SAMPLES_PER_FRAME];
     int audio_pos;
+    float audio_prev_out;     // DC-blocking filter: previous output
+    float audio_prev_in;      // DC-blocking filter: previous input
+    float audio_lpf;          // Low-pass filter state
 
     // AY (128K/+3)
     AYState ay;

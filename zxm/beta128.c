@@ -783,8 +783,10 @@ bool beta128_load_scl(Beta128* beta, int drive, const char* path) {
     drv->disk.data[0x8E6] = (uint8_t)((free_sectors >> 8) & 0xFF);
 
     drv->disk.data[0x8E7] = 0x10;  // TR-DOS ID
-
-    memset(&drv->disk.data[0x8F5], ' ', 8);  // etiqueta del disco
+    drv->disk.data[0x8E8] = 0x00;  // unused
+    memset(&drv->disk.data[0x8E9], 0x20, 9);  // unused (spaces per spec)
+    drv->disk.data[0x8F3] = 0x00;  // unused
+    memset(&drv->disk.data[0x8F5], ' ', 8);  // disk label
 
     free(scl_data);
 
@@ -823,6 +825,9 @@ bool beta128_insert_empty(Beta128* beta, int drive) {
     drv->disk.data[0x8E5] = 0xF0;  // free sectors low
     drv->disk.data[0x8E6] = 0x09;  // free sectors high
     drv->disk.data[0x8E7] = 0x10;  // TR-DOS ID byte
+    drv->disk.data[0x8E8] = 0x00;  // unused
+    memset(&drv->disk.data[0x8E9], 0x20, 9);  // unused (spaces per spec)
+    drv->disk.data[0x8F3] = 0x00;  // unused
     memset(&drv->disk.data[0x8F5], ' ', 8);  // disk label
 
     return true;
