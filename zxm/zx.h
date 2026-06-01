@@ -97,6 +97,7 @@ typedef enum {
     ZX_MODEL_128K,
     ZX_MODEL_PLUS3,
     ZX_MODEL_PENTAGON,
+    ZX_MODEL_PENTAGON1024,
     ZX_MODEL_SCORPION
 } ZXModel;
 
@@ -166,8 +167,8 @@ typedef struct {
     uint8_t rom_scorpion_service[16384];
     bool    have_rom_scorpion_service;
 
-    // RAM: 16 bancos x 16K (8 para 128K, 16 para Scorpion 256K)
-    uint8_t ram[16][16384];
+    // RAM: 64 bancos x 16K (8 para 128K, 16 para Scorpion 256K, 64 para Pentagon 1024)
+    uint8_t ram[64][16384];
 
     // Mapa actual de páginas 16K (0x0000..0xFFFF)
     uint8_t* mem_map[4];
@@ -187,6 +188,9 @@ typedef struct {
     // Puerto 0x1FFD (+2A/+3 y Scorpion)
     uint8_t  port_1ffd;
     bool     special_paging; // bit0 de 1FFD (+3) / bit0 = RAM overlay (Scorpion)
+
+    // Puerto 0xEFF7 (Pentagon 1024)
+    uint8_t  port_eff7;
 
     // Puntero al banco que usa la ULA como pantalla
     uint8_t* screen_ptr;
