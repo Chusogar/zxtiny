@@ -8,7 +8,6 @@
 #include "z80/jgz80/z80.h"
 #include "tzx.h"
 
-#include "tap_file.h"
 // FDC (uPD765) reutilizado del core CPC
 #include "cpc_fdc.h"
 
@@ -16,32 +15,70 @@
 #include "beta128.h"
 
 // ---------------------------------------------------------------------------
+// Temporización TAP (T-states a ~3.5 MHz)
+// ---------------------------------------------------------------------------
+#define TAP_PILOT_PULSE   2168
+#define TAP_PILOT_HEADER  8063
+#define TAP_PILOT_DATA    3223
+#define TAP_SYNC1_PULSE   667
+#define TAP_SYNC2_PULSE   735
+#define TAP_BIT0_PULSE    855
+#define TAP_BIT1_PULSE    1710
+#define TAP_PAUSE_CYCLES  3500000
+
+// ---------------------------------------------------------------------------
 // Geometría de pantalla (común 48/128/+3)
 // ---------------------------------------------------------------------------
-#define SCALE 1
-#define BORDER_LEFT 48
-#define BORDER_RIGHT 48
-#define BORDER_TOP 48
-#define BORDER_BOTTOM 48
-#define SCREEN_W 256
-#define SCREEN_H 192
-#define FULL_W (BORDER_LEFT + SCREEN_W + BORDER_RIGHT) // 352
-#define FULL_H (BORDER_TOP + SCREEN_H + BORDER_BOTTOM) // 288
+#define SCALE          1
+#define BORDER_LEFT    48
+#define BORDER_RIGHT   48
+#define BORDER_TOP     48
+#define BORDER_BOTTOM  48
+#define SCREEN_W       256
+#define SCREEN_H       192
+#define FULL_W         (BORDER_LEFT + SCREEN_W + BORDER_RIGHT)   // 352
+#define FULL_H         (BORDER_TOP  + SCREEN_H + BORDER_BOTTOM)  // 288
 
 // Límites verticales “lógicos” usados por el render actual
-#define ULA_FIRST_PAPER_LINE 64
-#define ULA_FIRST_VISIBLE_LINE 16
+#define ULA_FIRST_PAPER_LINE    64
+#define ULA_FIRST_VISIBLE_LINE  16
 
 // Máximo ticks/frame para dimensionar tablas (Pentagon: 224*320 = 71680)
 #define ULA_MAX_TICKS_PER_FRAME 71680
 
 // CPU / Audio
 #define ZX_CPU_CLOCK_HZ 3500000
-#define AUDIO_HZ 44100
-#define AUDIO_SAMPLES_PER_FRAME (AUDIO_HZ/50) // 882
+#define AUDIO_HZ        44100
+#define AUDIO_SAMPLES_PER_FRAME (AUDIO_HZ/50)  // 882
 
 // AY (Spectrum 128K / +3)
-#define AY_CLOCK_HZ 1773400 // ~3.5469MHz/2
+#define AY_CLOCK_HZ 1773400   // ~3.5469MHz/2
+
+// ---------------------------------------------------------------------------
+// Máquina de estados TAP
+// ---------------------------------------------------------------------------
+typedef enum {
+    TAP_STATE_IDLE = 0,
+    TAP_STATE_PILOT,
+    TAP_STATE_SYNC1,
+    TAP_STATE_SYNC2,
+    TAP_STATE_DATA,
+    TAP_STATE_PAUSE
+} TAPState;
+
+typedef struct {
+    uint8_t* data;
+    uint32_t size;
+    uint32_t pos;
+    uint32_t block_len;
+    uint32_t byte_pos;
+    uint8_t  bit_mask;
+    TAPState state;
+    int      pilot_count;
+    int32_t  pulse_cycles;
+    uint8_t  ear;
+    bool     active;
+} TAPPlayer;
 
 // ---------------------------------------------------------------------------
 // Selector de fuente de cinta activa
@@ -60,7 +97,6 @@ typedef enum {
     ZX_MODEL_128K,
     ZX_MODEL_PLUS3,
     ZX_MODEL_PENTAGON,
-    ZX_MODEL_PENTA1024,
     ZX_MODEL_SCORPION
 } ZXModel;
 
@@ -112,78 +148,59 @@ typedef struct {
 
     // --- Memoria (bancos 16K)
     uint8_t rom48[16384];
-    bool have_rom48;
+    bool    have_rom48;
 
     // ROM 128K: 2 x 16K
     uint8_t rom128[2][16384];
-    bool have_rom128;
+    bool    have_rom128;
 
     // ROM +3: 4 x 16K
     uint8_t rom_plus3[4][16384];
-    bool have_rom_plus3;
+    bool    have_rom_plus3;
 
     // ROM Beta 128 (TR-DOS): 1 x 16K
     uint8_t rom_beta[16384];
-    bool have_rom_beta;
+    bool    have_rom_beta;
 
     // ROM Scorpion service: 1 x 16K
     uint8_t rom_scorpion_service[16384];
-    bool have_rom_scorpion_service;
-
-    // ROM Scorpion ZS 256: 4 x 16K (scorpa..scorpd.rom) (opcional / futuro)
-    uint8_t rom_scorpion[4][16384];
-    bool have_rom_scorpion;
+    bool    have_rom_scorpion_service;
 
     // RAM: 16 bancos x 16K (8 para 128K, 16 para Scorpion 256K)
     uint8_t ram[16][16384];
 
-    // -----------------------------------------------------------------------
-    // Tabla de páginas activas AL ESTILO SpectrumFamilyMemory.glPageAt[] (Java)
-    //  - 0..15  => índice de RAM (ram[idx])
-    //  - 256+N  => “índice ROM” (la traducción a puntero se hace en zx.c)
-    // Segmentos:
-    //  page_at[0] = 0x0000-0x3FFF
-    //  page_at[1] = 0x4000-0x7FFF
-    //  page_at[2] = 0x8000-0xBFFF
-    //  page_at[3] = 0xC000-0xFFFF
-    // -----------------------------------------------------------------------
-    uint16_t page_at[4];
-
-    // Mapa actual de páginas 16K (punteros) (0x0000..0xFFFF)
+    // Mapa actual de páginas 16K (0x0000..0xFFFF)
     uint8_t* mem_map[4];
 
     // Estado de paginación
-    ZXModel model;
+    ZXModel  model;
 
     // Puerto 0x7FFD (128/+3)
-    uint8_t port_7ffd;
-    bool paging_lock;
-    uint8_t bank_c000;
-    uint8_t screen_bank;
+    uint8_t  port_7ffd;
+    bool     paging_lock;
+    uint8_t  bank_c000;
+    uint8_t  screen_bank;
 
-    // ROM seleccionada (128: 0/1, +3: 0..3, Scorpion/Penta1024: 0..3)
-    uint8_t rom_page;
+    // ROM seleccionada (128: 0/1, +3: 0..3)
+    uint8_t  rom_page;
 
     // Puerto 0x1FFD (+2A/+3 y Scorpion)
-    uint8_t port_1ffd;
-
-    // +3: bit0 => paginación especial
-    // Scorpion: bit0 => overlay RAM0 en 0x0000
-    bool special_paging;
+    uint8_t  port_1ffd;
+    bool     special_paging; // bit0 de 1FFD (+3) / bit0 = RAM overlay (Scorpion)
 
     // Puntero al banco que usa la ULA como pantalla
     uint8_t* screen_ptr;
 
     // --- Timing ULA
-    int ula_tstates_per_line;  // 48K=224, 128K/+3=228
-    int ula_lines_per_frame;   // 48K=312, 128K/+3=311
-    int ula_ticks_per_frame;   // 48K=69888, 128K/+3=70908
-    int ula_chars_per_line;    // 48K=56, 128K/+3=57
+    int ula_tstates_per_line;   // 48K=224, 128K/+3=228
+    int ula_lines_per_frame;    // 48K=312, 128K/+3=311
+    int ula_ticks_per_frame;    // 48K=69888, 128K/+3=70908
+    int ula_chars_per_line;     // 48K=56, 128K/+3=57
 
     // SDL vídeo
-    SDL_Window* window;
+    SDL_Window*   window;
     SDL_Renderer* renderer;
-    SDL_Texture* texture;
+    SDL_Texture*  texture;
     uint32_t framebuffer[FULL_W * FULL_H];
 
     // ── ULA: renderizado por T-state ───────────────────────────────
@@ -228,16 +245,13 @@ typedef struct {
     // FDC (+3)
     FDC fdc;
 
-    // Beta 128 (Pentagon/Scorpion):
-    // “TR-DOS mapeado en 0x0000-0x3FFF”
-    bool trdos_mapped;
-	bool beta_active;
-
+    // Beta 128 (Pentagon/Scorpion)
     Beta128 beta;
+    bool beta_active;     // ROM Beta paginada en 0x0000-0x3FFF
 
     // Cintas
-    TAPPlayer tap;
-    TZXPlayer tzx;
+    TAPPlayer  tap;
+    TZXPlayer  tzx;
     TapeSource tape_src;
 
     bool quit;
@@ -249,28 +263,21 @@ typedef struct {
 void spectrum_init(ZXSpectrum* spec, ZXModel model);
 void spectrum_destroy(ZXSpectrum* spec);
 
-int spectrum_load_rom48(ZXSpectrum* spec, const char* filename);
-int spectrum_load_rom128(ZXSpectrum* spec, const char* filename); // 32K (2x16K)
+int  spectrum_load_rom48(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_rom128(ZXSpectrum* spec, const char* filename); // 32K (2x16K)
 
 // +3: 4 ROMs de 16KB (plus3-0..3)
-int spectrum_load_rom_plus3_set(ZXSpectrum* spec,
-    const char* rom0,
-    const char* rom1,
-    const char* rom2,
-    const char* rom3);
+int  spectrum_load_rom_plus3_set(ZXSpectrum* spec,
+                                const char* rom0,
+                                const char* rom1,
+                                const char* rom2,
+                                const char* rom3);
+int  spectrum_load_rom_beta(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_rom_scorpion_service(ZXSpectrum* spec, const char* filename);
 
-int spectrum_load_rom_beta(ZXSpectrum* spec, const char* filename);
-int spectrum_load_rom_scorpion_service(ZXSpectrum* spec, const char* filename);
-
-int spectrum_load_rom_scorpion_set(ZXSpectrum* spec,
-    const char* roma,
-    const char* romb,
-    const char* romc,
-    const char* romd);
-
-int spectrum_load_sna(ZXSpectrum* spec, const char* filename);
-int spectrum_load_tap(ZXSpectrum* spec, const char* filename);
-int spectrum_load_tzx(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_sna(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_tap(ZXSpectrum* spec, const char* filename);
+int  spectrum_load_tzx(ZXSpectrum* spec, const char* filename);
 
 void spectrum_tape_start(ZXSpectrum* spec);
 void spectrum_handle_key(ZXSpectrum* spec, SDL_Scancode key, bool pressed);
@@ -278,3 +285,4 @@ void spectrum_run_frame(ZXSpectrum* spec);
 void spectrum_render(ZXSpectrum* spec);
 
 #endif // SPECTRUM_H
+

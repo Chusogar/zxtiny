@@ -333,30 +333,37 @@ static void render_fg(Phoenix* p) {
 // screen: W=208, H=256
 // bg_scroll: desplazamiento en X del logbuf (en pixels), aplicado como wrap-around
 static void apply_rot_and_scroll(Phoenix* p) {
-    // En MAME el scroll se aplica SOLO al fondo (tmpbitmap) y luego se dibuja el foreground encima.
-    // bg_scroll es un desplazamiento de 0..255; MAME usa scroll = -bg_scroll.
-    const int scroll = (int)(uint8_t)(-(int8_t)p->bg_scroll) & 0xFF;
+    /*
+     * Phoenix (MAME) rota la pantalla 90º CCW. Nosotros dibujamos primero en un
+     * buffer sin rotar (logbuf/fgbuf) de 256x208 y aquí:
+     *   - aplicamos el scroll del BG (registro 0x5800)
+     *   - rotamos 90º CCW al framebuffer final 208x256
+     *
+     * Rotación 90º CCW (dst->src):
+     *   src_x = dst_y
+     *   src_y = (H - 1) - dst_x
+     * con W=256, H=208.
+     */
 
-    for (int oy = 0; oy < PHX_SCREEN_H; oy++) {        // output y: 0..255
-        // ROT90 CCW inverse mapping: src_x = W-1-oy, src_y = ox
-        const int src_x_noscroll = (PHX_LOG_W - 1 - oy);
-        const int src_x_bg = (src_x_noscroll + scroll) & 0xFF;
+    // MAME: scroll = -phoenix_scroll (8-bit wrap)
+    const int scroll = (-((int)p->bg_scroll)) & 0xFF;
 
-        for (int ox = 0; ox < PHX_SCREEN_W; ox++) {    // output x: 0..207
-            const int src_y = ox;
+    for (int oy = 0; oy < PHX_SCREEN_H; oy++) {            // dst_y: 0..255
+        const int src_x_noscroll = oy & 0xFF;              // 0..255
+        const int src_x_bg       = (src_x_noscroll + scroll) & 0xFF;
 
-            // Fondo con scroll
-            uint32_t bg = p->logbuf[src_y * PHX_LOG_W + src_x_bg];
-            // Foreground sin scroll
-            uint32_t fg = p->fgbuf[src_y * PHX_LOG_W + src_x_noscroll];
+        for (int ox = 0; ox < PHX_SCREEN_W; ox++) {        // dst_x: 0..207
+            const int src_y = (PHX_LOG_H - 1) - ox;        // 207..0
 
-            // FIX: el resultado estaba girado 180º -> invertimos el destino (flip X+Y)
-            const int dx = (PHX_SCREEN_W - 1) - ox;
-            const int dy = (PHX_SCREEN_H - 1) - oy;
-            p->framebuffer[dy * PHX_SCREEN_W + dx] = (fg & 0xFF000000u) ? fg : bg;
+            const uint32_t bg = p->logbuf[src_y * PHX_LOG_W + src_x_bg];
+            const uint32_t fg = p->fgbuf[src_y * PHX_LOG_W + src_x_noscroll];
+
+            // Componer (FG pen0 transparente => alpha=0)
+            p->framebuffer[oy * PHX_SCREEN_W + ox] = (fg & 0xFF000000u) ? fg : bg;
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // phoenix_run_frame / phoenix_render
@@ -517,35 +524,35 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(a, "--rom") && i + 1 < argc) {
             phoenix_load_rom(&p, argv[++i]);
         }
-        else if (!strcmp(a, "--ic45") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x0000, 0x0800);
-        else if (!strcmp(a, "--ic46") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x0800, 0x0800);
-        else if (!strcmp(a, "--ic47") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x1000, 0x0800);
-        else if (!strcmp(a, "--ic48") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x1800, 0x0800);
-        else if (!strcmp(a, "--ic49") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x2000, 0x0800);
-        else if (!strcmp(a, "--ic50") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x2800, 0x0800);
-        else if (!strcmp(a, "--ic51") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x3000, 0x0800);
-        else if (!strcmp(a, "--ic52") && i + 1 < argc) phoenix_load_rom_chunk(&p, argv[++i], 0x3800, 0x0800);
+        /*else if (!strcmp(a, "--ic45") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic45", 0x0000, 0x0800);
+        /*else if (!strcmp(a, "--ic46") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic46", 0x0800, 0x0800);
+        /*else if (!strcmp(a, "--ic47") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic47", 0x1000, 0x0800);
+        /*else if (!strcmp(a, "--ic48") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic48", 0x1800, 0x0800);
+        /*else if (!strcmp(a, "--ic49") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic49", 0x2000, 0x0800);
+        /*else if (!strcmp(a, "--ic50") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic50", 0x2800, 0x0800);
+        /*else if (!strcmp(a, "--ic51") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic51", 0x3000, 0x0800);
+        /*else if (!strcmp(a, "--ic52") && i + 1 < argc)*/ phoenix_load_rom_chunk(&p, "roms/phoenix/ic52", 0x3800, 0x0800);
 
-        else if (!strcmp(a, "--ic23") && i + 1 < argc) phoenix_load_gfx(&p, 1, argv[++i], 0x0000, 0x0800);
-        else if (!strcmp(a, "--ic24") && i + 1 < argc) phoenix_load_gfx(&p, 1, argv[++i], 0x0800, 0x0800);
+        /*else if (!strcmp(a, "--ic23") && i + 1 < argc)*/ phoenix_load_gfx(&p, 1, "roms/phoenix/ic23", 0x0000, 0x0800);
+        /*else if (!strcmp(a, "--ic24") && i + 1 < argc)*/ phoenix_load_gfx(&p, 1, "roms/phoenix/ic24", 0x0800, 0x0800);
 
-        else if (!strcmp(a, "--ic39") && i + 1 < argc) phoenix_load_gfx(&p, 2, argv[++i], 0x0000, 0x0800);
-        else if (!strcmp(a, "--ic40") && i + 1 < argc) phoenix_load_gfx(&p, 2, argv[++i], 0x0800, 0x0800);
+        /*else if (!strcmp(a, "--ic39") && i + 1 < argc)*/ phoenix_load_gfx(&p, 2, "roms/phoenix/ic39", 0x0000, 0x0800);
+        /*else if (!strcmp(a, "--ic40") && i + 1 < argc)*/ phoenix_load_gfx(&p, 2, "roms/phoenix/ic40", 0x0800, 0x0800);
 
-        else if (!strcmp(a, "--prom-lo") && i + 1 < argc) phoenix_load_prom(&p, 0, argv[++i]);
-        else if (!strcmp(a, "--prom-hi") && i + 1 < argc) phoenix_load_prom(&p, 1, argv[++i]);
+        /*else if (!strcmp(a, "--prom-lo") && i + 1 < argc)*/ phoenix_load_prom(&p, 0, "roms/phoenix/ic40_b.bin");
+        /*else if (!strcmp(a, "--prom-hi") && i + 1 < argc)*/ phoenix_load_prom(&p, 1, "roms/phoenix/ic41_a.bin");
 
-        else {
+        /*else {
             fprintf(stderr, "Opcion desconocida: %s\n", a);
             print_usage(argv[0]);
             return 1;
-        }
+        }*/
     }
 
-    if (!p.have_rom || !p.have_gfx1 || !p.have_gfx2 || !p.have_proms) {
+    /*if (!p.have_rom || !p.have_gfx1 || !p.have_gfx2 || !p.have_proms) {
         fprintf(stderr, "\nFaltan ROMs/GFX/PROMs. Usa --help.\n");
         return 1;
-    }
+    }*/
 
     phoenix_decode_gfx(&p);
     phoenix_build_palette(&p);
