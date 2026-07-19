@@ -183,6 +183,11 @@ typedef struct {
     // Control de motor (puerto 0xFA7E del CPC)
     bool      motor;         // motor encendido
 
+    // Resultado guardado para SENSE INTERRUPT STATUS
+    uint8_t   sint_st0;      // ST0 generado por SEEK/RECALIBRATE
+    uint8_t   sint_pcn;      // PCN (Present Cylinder Number)
+    bool      sint_pending;  // hay interrupción de seek pendiente
+
 } FDC;
 
 // ─────────────────────────────────────────────────────────────────────────────
